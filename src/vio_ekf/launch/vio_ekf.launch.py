@@ -77,6 +77,16 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Static TF from camera_link -> camera sensor frame (identity transform)
+    cam_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=['0', '0', '0', '0', '0', '0',
+                   'vio_robot/camera_link', 'vio_robot/camera_link/camera'],
+        parameters=[{'use_sim_time': True}],
+        output='screen'
+    )
+
     # 5. Rviz2
     rviz = Node(
         package='rviz2',
@@ -93,5 +103,6 @@ def generate_launch_description():
         bridge,
         ground_truth,
         tf_world_to_model,
+        cam_tf,
         rviz
     ])
