@@ -23,7 +23,7 @@ def generate_launch_description():
         value=models_path + ':' + os.environ.get('IGN_GAZEBO_RESOURCE_PATH', '')
     )
 
-    # 1. Start Ignition Gazebo with our world
+    #  Start Ignition Gazebo with our world
     sdf_path = os.path.join(pkg_vio, 'worlds', 'landmarks.sdf')
 
     # Use gz or ign depending on availability (like reference file)
@@ -31,7 +31,7 @@ def generate_launch_description():
         else ['ign', 'gazebo', '-r', sdf_path, '--force-version', '6']
     gz_sim = ExecuteProcess(cmd=gz_cmd, output='screen')
 
-    # 2. Bridge ROS2 <-> Ignition (using @ for bidirectional like reference)
+    #  Bridge ROS2 <-> Ignition (using @ for bidirectional like reference)
     bridge_args = [
         # IMU (GZ -> ROS)
         '/imu@sensor_msgs/msg/Imu@ignition.msgs.IMU',
@@ -51,7 +51,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 3. Ground Truth Publisher (Our Custom Node)
+    #  Ground Truth Publisher (Our Custom Node)
     # Subscribes to TFMessage on 'pose' and 'pose_static' topics and broadcasts to /tf
     ground_truth = Node(
         package='vio_ekf',
@@ -65,7 +65,7 @@ def generate_launch_description():
         ]
     )
 
-    # 4. Static TF: world -> vio_robot (connects world to model root frame)
+    #  Static TF: world -> vio_robot (connects world to model root frame)
     # Using --frame-id and --child-frame-id for proper static publisher
     tf_world_to_model = Node(
         package='tf2_ros',
@@ -87,13 +87,21 @@ def generate_launch_description():
         output='screen'
     )
 
-    # 5. Rviz2
+    #  Rviz2
     rviz = Node(
         package='rviz2',
         executable='rviz2',
         # arguments=['-d', os.path.join(pkg_vio, 'rviz', 'vio.rviz')], # Enable once we save a config
         parameters=[{'use_sim_time': True}],
         output='screen'
+    )
+
+    # Vision Frontend Node
+    vision_node = Node(
+        package='vio_ekf',
+        executable='vision_node.py',
+        name='vision_node',
+        output='screen',
     )
 
     return LaunchDescription([
@@ -104,5 +112,6 @@ def generate_launch_description():
         ground_truth,
         tf_world_to_model,
         cam_tf,
+        vision_node,
         rviz
     ])

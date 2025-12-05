@@ -4,17 +4,17 @@ Phase 1: Environment Setup (Simulated World)
 
 [x] Build Package: Create the vio_ekf ROS2 package structure. (In Progress)
 
-[ ] World: Verify landmarks.sdf loads in Gazebo Fortress with colored cylinders.
+[x] World: Verify landmarks.sdf loads in Gazebo Fortress with colored cylinders.
 
-[ ] Robot: Verify the robot spawns with IMU/Camera plugins loaded.
+[x] Robot: Verify the robot spawns with IMU/Camera plugins loaded.
 
-[ ] Sensors: Check topics /imu and /camera via ros2 topic list.
+[x] Sensors: Check topics /imu and /camera via ros2 topic list.
 
-[ ] Ground Truth: Verify pose_tf_broadcaster is publishing TFs from Map -> Odom -> Base.
+[x] Ground Truth: Verify pose_tf_broadcaster is publishing TFs from Map -> Odom -> Base.
 
 Phase 2: Visual Frontend (The Eyes)
 
-[ ] Feature Extraction: Implement simple color thresholding in vision_node.py.
+[x] Feature Extraction: Implement simple color thresholding in vision_node.py.
 
 [ ] Data Association: For this phase, we assume Known Correspondence (Red=1, Green=2).
 

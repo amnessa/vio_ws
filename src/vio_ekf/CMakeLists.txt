@@ -18,9 +18,15 @@ include_directories(include)
 add_executable(pose_tf_broadcaster src/pose_tf_broadcaster.cpp)
 ament_target_dependencies(pose_tf_broadcaster rclcpp geometry_msgs tf2_msgs tf2_ros)
 
-# Install rules
+# Install C++ nodes
 install(TARGETS
   pose_tf_broadcaster
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install Python nodes
+install (PROGRAMS
+  src/vision_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
