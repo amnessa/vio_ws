@@ -1,0 +1,61 @@
+# Diff drive configuration.
+- topic_name: "/model/vehicle_blue/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_topic_name: "/model/vehicle_blue/cmd_vel"
+  gz_type_name: "gz.msgs.Twist"
+  direction: BIDIRECTIONAL
+
+- topic_name: "/model/vehicle_blue/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_topic_name: "/model/vehicle_blue/odometry"
+  gz_type_name: "gz.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- topic_name: "/model/vehicle_green/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_topic_name: "/model/vehicle_green/cmd_vel"
+  gz_type_name: "gz.msgs.Twist"
+  direction: BIDIRECTIONAL
+
+- topic_name: "/model/vehicle_green/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_topic_name: "/model/vehicle_green/odometry"
+  gz_type_name: "gz.msgs.Odometry"
+  direction: BIDIRECTIONAL
+
+- ros_topic_name: "/tf"
+  gz_topic_name: "/model/vehicle_green/tf"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/tf"
+  gz_topic_name: "/model/vehicle_blue/tf"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /vehicle_blue/camera/image_raw
+  gz_topic_name: /world/$(world)/model/vehicle_blue/link/camera_link_blue/sensor/rgbd_blue/image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /vehicle_blue/camera/depth/image_raw
+  gz_topic_name: /world/$(world)/model/vehicle_blue/link/camera_link_blue/sensor/rgbd_blue/depth_image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+
+# Duplicate for green with its own link/sensor names
+- ros_topic_name: /vehicle_green/camera/image_raw
+  gz_topic_name: /world/$(world)/model/vehicle_green/link/camera_link_green/sensor/rgbd_green/image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /vehicle_green/camera/depth/image_raw
+  gz_topic_name: /world/$(world)/model/vehicle_green/link/camera_link_green/sensor/rgbd_green/depth_image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
