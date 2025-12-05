@@ -38,9 +38,15 @@ def generate_launch_description():
         # Camera image and camera_info (GZ -> ROS)
         '/camera@sensor_msgs/msg/Image@ignition.msgs.Image',
         '/camera_info@sensor_msgs/msg/CameraInfo@ignition.msgs.CameraInfo',
+        # LiDAR (GZ -> ROS)
+        '/scan@sensor_msgs/msg/LaserScan@ignition.msgs.LaserScan',
         # Ground-truth poses (GZ -> ROS) - Bridge Pose_V to TFMessage
-        '/model/vio_robot/pose@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
-        '/model/vio_robot/pose_static@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
+        '/model/turtlebot3/pose@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
+        '/model/turtlebot3/pose_static@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
+        # Odometry (GZ -> ROS)
+        '/odom@nav_msgs/msg/Odometry@ignition.msgs.Odometry',
+        # Cmd vel (ROS -> GZ)
+        '/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist',
         # Clock (GZ -> ROS) - required for use_sim_time
         '/clock@rosgraph_msgs/msg/Clock@ignition.msgs.Clock',
     ]
@@ -60,19 +66,18 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': True}],
         remappings=[
-            ('pose', '/model/vio_robot/pose'),
-            ('pose_static', '/model/vio_robot/pose_static'),
+            ('pose', '/model/turtlebot3/pose'),
+            ('pose_static', '/model/turtlebot3/pose_static'),
         ]
     )
 
-    #  Static TF: world -> vio_robot (connects world to model root frame)
-    # Using --frame-id and --child-frame-id for proper static publisher
+    #  Static TF: world -> turtlebot3 (connects world to model root frame)
     tf_world_to_model = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         arguments=['--x', '0', '--y', '0', '--z', '0',
                    '--roll', '0', '--pitch', '0', '--yaw', '0',
-                   '--frame-id', 'world', '--child-frame-id', 'vio_robot'],
+                   '--frame-id', 'world', '--child-frame-id', 'turtlebot3'],
         parameters=[{'use_sim_time': True}],
         output='screen'
     )
@@ -82,7 +87,7 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         arguments=['0', '0', '0', '0', '0', '0',
-                   'vio_robot/camera_link', 'vio_robot/camera_link/camera'],
+                   'turtlebot3/camera_link', 'turtlebot3/camera_link/camera'],
         parameters=[{'use_sim_time': True}],
         output='screen'
     )
