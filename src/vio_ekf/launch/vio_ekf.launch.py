@@ -9,7 +9,7 @@ import shutil
 
 def generate_launch_description():
     pkg_vio = get_package_share_directory('vio_ekf')
-    pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
+    #pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
 
     # Set GZ_SIM_RESOURCE_PATH so Gazebo can find our models
     models_path = os.path.join(pkg_vio, 'models')
@@ -64,7 +64,10 @@ def generate_launch_description():
         executable='pose_tf_broadcaster',
         name='pose_tf_broadcaster',
         output='screen',
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': True,
+                     'pose_topic': '/model/turtlebot3/pose',
+                     'parent_frame': 'map',
+                     'child_frame': 'base_footprint_gt'}], # Rename frame to avoid conflicts with EKF
         remappings=[
             ('pose', '/model/turtlebot3/pose'),
             ('pose_static', '/model/turtlebot3/pose_static'),
@@ -109,6 +112,13 @@ def generate_launch_description():
         output='screen',
     )
 
+    ekf_node = Node(
+        package='vio_ekf',
+        executable='ekf_node.py',
+        name='ekf_node',
+        output='screen',
+    )
+
     return LaunchDescription([
         gz_resource_path,
         ign_resource_path,
@@ -116,6 +126,7 @@ def generate_launch_description():
         bridge,
         ground_truth,
         tf_world_to_model,
+        ekf_node,
         cam_tf,
         vision_node,
         rviz

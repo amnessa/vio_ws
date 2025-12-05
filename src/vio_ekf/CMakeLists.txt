@@ -27,6 +27,7 @@ install(TARGETS
 # Install Python nodes
 install (PROGRAMS
   src/vision_node.py
+  src/ekf_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
