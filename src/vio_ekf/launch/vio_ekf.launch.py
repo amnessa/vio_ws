@@ -58,6 +58,7 @@ def generate_launch_description():
         executable='pose_tf_broadcaster',
         name='pose_tf_broadcaster',
         output='screen',
+        parameters=[{'use_sim_time': True}],
         remappings=[
             ('pose', '/model/vio_robot/pose'),
             ('pose_static', '/model/vio_robot/pose_static'),
@@ -72,6 +73,7 @@ def generate_launch_description():
         arguments=['--x', '0', '--y', '0', '--z', '0',
                    '--roll', '0', '--pitch', '0', '--yaw', '0',
                    '--frame-id', 'world', '--child-frame-id', 'vio_robot'],
+        parameters=[{'use_sim_time': True}],
         output='screen'
     )
 
