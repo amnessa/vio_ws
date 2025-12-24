@@ -18,6 +18,8 @@
 #include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 
 /**
  * @brief A ROS2 node that subscribes to pose messages and broadcasts them as TF transforms.
@@ -47,7 +49,29 @@ public:
     sub_pose_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
       "pose", tf_qos,
       [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) {
-        tf_br_->sendTransform(msg->transforms);
+        // Extract robot's ground truth pose from world dynamic_pose/info
+        // The frame_id is "turtlebot3" for the robot model's world pose
+        for (const auto& transform : msg->transforms) {
+          if (transform.child_frame_id == "turtlebot3") {
+            // Publish ground truth odometry
+            nav_msgs::msg::Odometry odom_msg;
+            odom_msg.header.stamp = transform.header.stamp;
+            odom_msg.header.frame_id = "map";
+            odom_msg.child_frame_id = "base_footprint_gt";
+            odom_msg.pose.pose.position.x = transform.transform.translation.x;
+            odom_msg.pose.pose.position.y = transform.transform.translation.y;
+            odom_msg.pose.pose.position.z = transform.transform.translation.z;
+            odom_msg.pose.pose.orientation = transform.transform.rotation;
+            pub_gt_odom_->publish(odom_msg);
+
+            // Also broadcast as TF: map -> base_footprint_gt
+            geometry_msgs::msg::TransformStamped tf_msg = transform;
+            tf_msg.header.frame_id = "map";
+            tf_msg.child_frame_id = "base_footprint_gt";
+            tf_br_->sendTransform(tf_msg);
+            break;
+          }
+        }
       });
 
     // Subscribe to static pose updates and broadcast them as static TF transforms
@@ -57,6 +81,9 @@ public:
       [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) {
         static_br_->sendTransform(msg->transforms);
       });
+
+    // Publisher for ground truth odometry (converts pose to Odometry message)
+    pub_gt_odom_ = this->create_publisher<nav_msgs::msg::Odometry>("/ground_truth/odom", 10);
   }
 
 private:
@@ -71,6 +98,9 @@ private:
 
   // Subscription for incoming static pose messages
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_pose_static_;
+
+  // Publisher for ground truth odometry
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_gt_odom_;
 };
 
 int main(int argc, char **argv)

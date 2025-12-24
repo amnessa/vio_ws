@@ -11,12 +11,13 @@ find_package(geometry_msgs REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 
 include_directories(include)
 
 # The Ground Truth Node
 add_executable(pose_tf_broadcaster src/pose_tf_broadcaster.cpp)
-ament_target_dependencies(pose_tf_broadcaster rclcpp geometry_msgs tf2_msgs tf2_ros)
+ament_target_dependencies(pose_tf_broadcaster rclcpp geometry_msgs tf2_msgs tf2_ros nav_msgs)
 
 # Install C++ nodes
 install(TARGETS

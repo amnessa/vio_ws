@@ -38,10 +38,12 @@ def generate_launch_description():
         # Camera image and camera_info (GZ -> ROS)
         '/camera@sensor_msgs/msg/Image@ignition.msgs.Image',
         '/camera_info@sensor_msgs/msg/CameraInfo@ignition.msgs.CameraInfo',
-        # Odometry (GZ -> ROS) - includes odom->base_footprint TF
+        # Odometry (GZ -> ROS) - wheel odometry from diff_drive
         '/odom@nav_msgs/msg/Odometry@ignition.msgs.Odometry',
         # TF from diff_drive (odom -> base_footprint)
         '/tf@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
+        # Ground truth: world dynamic pose contains all model poses in world frame
+        '/world/vio_world/dynamic_pose/info@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
         # Cmd vel (ROS -> GZ)
         '/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist',
         # Clock (GZ -> ROS) - required for use_sim_time
@@ -57,19 +59,16 @@ def generate_launch_description():
     )
 
     #  Ground Truth Publisher (Our Custom Node)
-    # Subscribes to TFMessage on 'pose' and 'pose_static' topics and broadcasts to /tf
+    # Subscribes to world pose info and extracts robot's ground truth pose
+    # Publishes to /ground_truth/odom and broadcasts TF
     ground_truth = Node(
         package='vio_ekf',
         executable='pose_tf_broadcaster',
         name='pose_tf_broadcaster',
         output='screen',
-        parameters=[{'use_sim_time': True,
-                     'pose_topic': '/model/turtlebot3/pose',
-                     'parent_frame': 'map',
-                     'child_frame': 'base_footprint_gt'}], # Rename frame to avoid conflicts with EKF
+        parameters=[{'use_sim_time': True}],
         remappings=[
-            ('pose', '/model/turtlebot3/pose'),
-            ('pose_static', '/model/turtlebot3/pose_static'),
+            ('pose', '/world/vio_world/dynamic_pose/info'),
         ]
     )
 
@@ -161,5 +160,7 @@ def generate_launch_description():
         robot_state_publisher,
         ekf_node,
         vision_node,
+        ground_truth,
+        cam_tf,
         rviz
     ])
