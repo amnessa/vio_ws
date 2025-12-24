@@ -7,9 +7,8 @@ Panels:
         - /Global Options1
         - /TF1
         - /RobotModel1
-        - /Camera1
         - /EKF Odometry1
-        - /EKF Path1
+        - /Ground Truth Odom1
       Splitter Ratio: 0.5
     Tree Height: 700
   - Class: rviz_common/Selection
@@ -54,7 +53,7 @@ Visualization Manager:
       Reference Frame: <Fixed Frame>
       Value: true
 
-    # TF Tree Visualization
+    # TF Tree Visualization - show key frames only
     - Class: rviz_default_plugins/TF
       Enabled: true
       Frame Timeout: 15
@@ -62,7 +61,7 @@ Visualization Manager:
         All Enabled: true
       Marker Scale: 0.3
       Name: TF
-      Show Arrows: true
+      Show Arrows: false
       Show Axes: true
       Show Names: true
       Tree:
@@ -114,6 +113,7 @@ Visualization Manager:
         Value: /camera
       Value: true
 
+    # ========== EKF ESTIMATED STATE (GREEN) ==========
     # EKF Estimated Odometry
     - Class: rviz_default_plugins/Odometry
       Covariance:
@@ -127,12 +127,12 @@ Visualization Manager:
           Value: true
         Position:
           Alpha: 0.3
-          Color: 204; 51; 204
+          Color: 0; 255; 0
           Scale: 1
           Value: true
         Value: true
       Enabled: true
-      Keep: 100
+      Keep: 50
       Name: EKF Odometry
       Position Tolerance: 0.1
       Angle Tolerance: 0.1
@@ -155,7 +155,7 @@ Visualization Manager:
         Value: /vio/odom
       Value: true
 
-    # EKF Estimated Path
+    # EKF Estimated Path (GREEN)
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
@@ -166,11 +166,11 @@ Visualization Manager:
       Length: 0.3
       Line Style: Lines
       Line Width: 0.03
-      Name: EKF Path
+      Name: EKF Path (Estimated)
       Offset:
         X: 0
         Y: 0
-        Z: 0
+        Z: 0.02
       Pose Color: 255; 85; 255
       Pose Style: None
       Radius: 0.03
@@ -185,7 +185,8 @@ Visualization Manager:
         Value: /vio/path
       Value: true
 
-    # Ground Truth Odometry (for comparison)
+    # ========== GROUND TRUTH (RED) ==========
+    # Ground Truth Odometry from Gazebo (for comparison)
     - Class: rviz_default_plugins/Odometry
       Covariance:
         Orientation:
@@ -198,12 +199,12 @@ Visualization Manager:
           Value: false
         Position:
           Alpha: 0.3
-          Color: 204; 51; 204
+          Color: 255; 0; 0
           Scale: 1
           Value: false
         Value: false
       Enabled: true
-      Keep: 100
+      Keep: 50
       Name: Ground Truth Odom
       Position Tolerance: 0.1
       Angle Tolerance: 0.1
@@ -226,19 +227,19 @@ Visualization Manager:
         Value: /odom
       Value: true
 
-    # Axes at origin for reference
+    # Axes at world origin for reference
     - Class: rviz_default_plugins/Axes
       Enabled: true
       Length: 1
-      Name: World Axes
+      Name: World Origin
       Radius: 0.05
-      Reference Frame: world
+      Reference Frame: odom
       Value: true
 
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: map
+    Fixed Frame: odom
     Frame Rate: 30
 
   Name: root

@@ -38,11 +38,10 @@ def generate_launch_description():
         # Camera image and camera_info (GZ -> ROS)
         '/camera@sensor_msgs/msg/Image@ignition.msgs.Image',
         '/camera_info@sensor_msgs/msg/CameraInfo@ignition.msgs.CameraInfo',
-        # Ground-truth poses (GZ -> ROS) - Bridge Pose_V to TFMessage
-        '/model/turtlebot3/pose@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
-        '/model/turtlebot3/pose_static@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
-        # Odometry (GZ -> ROS)
+        # Odometry (GZ -> ROS) - includes odom->base_footprint TF
         '/odom@nav_msgs/msg/Odometry@ignition.msgs.Odometry',
+        # TF from diff_drive (odom -> base_footprint)
+        '/tf@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
         # Cmd vel (ROS -> GZ)
         '/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist',
         # Clock (GZ -> ROS) - required for use_sim_time
@@ -74,13 +73,26 @@ def generate_launch_description():
         ]
     )
 
-    #  Static TF: world -> turtlebot3 (connects world to model root frame)
-    tf_world_to_model = Node(
+    #  Static TF: world -> map (they are the same in our simulation)
+    tf_world_to_map = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
+        name='tf_world_map',
         arguments=['--x', '0', '--y', '0', '--z', '0',
                    '--roll', '0', '--pitch', '0', '--yaw', '0',
-                   '--frame-id', 'world', '--child-frame-id', 'turtlebot3'],
+                   '--frame-id', 'world', '--child-frame-id', 'map'],
+        parameters=[{'use_sim_time': True}],
+        output='screen'
+    )
+
+    # Static TF: world -> odom (for odometry messages from Gazebo diff_drive)
+    tf_world_to_odom = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='tf_world_odom',
+        arguments=['--x', '0', '--y', '0', '--z', '0',
+                   '--roll', '0', '--pitch', '0', '--yaw', '0',
+                   '--frame-id', 'world', '--child-frame-id', 'odom'],
         parameters=[{'use_sim_time': True}],
         output='screen'
     )
@@ -95,7 +107,9 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Robot State Publisher (reads URDF and publishes TF for robot links)
+    # Robot State Publisher - publishes robot_description for RViz visualization
+    # Publishes TFs for robot links connected to base_footprint
+    # The odom->base_footprint transform comes from Gazebo diff_drive plugin
     urdf_file = os.path.join(pkg_vio, 'urdf', 'turtlebot3_waffle_pi.urdf')
     with open(urdf_file, 'r') as f:
         robot_desc = f.read()
@@ -142,11 +156,10 @@ def generate_launch_description():
         ign_resource_path,
         gz_sim,
         bridge,
-        ground_truth,
-        tf_world_to_model,
+        tf_world_to_map,
+        tf_world_to_odom,
         robot_state_publisher,
         ekf_node,
-        cam_tf,
         vision_node,
         rviz
     ])
