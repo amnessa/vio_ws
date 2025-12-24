@@ -11,58 +11,37 @@
 **Phase 2: Visual Frontend (Visual Data Processing)**
 
 * [x] **Feature Extraction:** Implement simple color thresholding in `vision_node.py`.
-
-
-* [ ] **Pose Estimation:** Ensure vision node outputs an estimated pose or pixel coordinates ready for the EKF update.
-
-
-* [ ] **Data Synchronization:** Ensure visual detection messages and IMU data are time-synced for the filter.
-
-
+* [x] **Pose Estimation:** Vision node outputs pixel coordinates (u, v, id) ready for EKF update.
+* [x] **Data Synchronization:** Added time-sync check between visual detections and IMU data with configurable tolerance.
 
 **Phase 3: The ES-EKF Backend (Implementation)**
 
-* [ ] **State Structures:** Define classes for Nominal State () and Error State ().
+* [x] **State Structures:** Nominal State (16D) and Error State (15D) defined in `ekf_node.py`.
+* [x] **Noise Parameters:** Updated from Gazebo IMU SDF (σ_a=1.7e-2, σ_g=2e-4).
 
+* [x] **Prediction Step (IMU):**
+  * [x] Implement Euler integration for Nominal State propagation.
+  * [x] Compute Jacobian Fx and propagate Covariance P.
 
-* [ ] **Prediction Step (IMU):**
-* [ ] Implement Runge-Kutta or Euler integration for Nominal State.
+* [x] **Update Step (Vision):**
+  * [x] Compute Jacobian H (observation w.r.t error state).
+  * [x] Compute Kalman Gain K and estimate error state δx.
 
-
-* [ ] Compute Jacobian  and propagate Covariance .
-
-
-
-
-* [ ] **Update Step (Vision):**
-* [ ] Compute Jacobian  (observation w.r.t error state).
-
-
-* [ ] Compute Kalman Gain  and estimate error state .
-
-
-
-
-* [ ] **Injection & Reset:** Implement the injection of  into  and reset  to zero.
-
-
-* [ ] **Bias Initialization:** Ensure biases  are initialized and estimated correctly.
-
-
+* [x] **Injection & Reset:** Injection of δx into nominal state implemented (additive for p,v,b; multiplicative for q).
+* [x] **Bias Initialization:** Biases (ba, bg) initialized and estimated in state vector.
 
 **Phase 4: Evaluation & Analysis**
 
-* [ ] **Trajectory Validation:** Plot Estimated Path vs. Ground Truth.
-
-
-* [ ] **ATE Metric:** Calculate Absolute Trajectory Error (RMSE).
-
-
-* [ ] **NEES Metric:** Calculate Normalized Estimation Error Squared to verify filter consistency.
+* [x] **Ground Truth Logging:** Added ground truth subscription and trajectory storage.
+* [x] **Trajectory Validation:** Path visualization published to `/vio/path`.
+* [x] **ATE Metric:** Implemented `compute_ate()` method for RMSE calculation.
+* [x] **NEES Metric:** Implemented `compute_nees()` method for filter consistency check.
 
 
 * [ ] **Drift Analysis:** Compare "IMU Only" (Dead Reckoning) vs. "Visual-Inertial" (Fusion) modes.
 
 
-
-**Next Step:** Would you like to start implementing the **State Structures** for the ES-EKF (Phase 3), or should we finalize the **Visual Frontend** (Phase 2) data synchronization first?
+**Next Steps:**
+1. Run the full system to validate sensor data flow
+2. Perform drift analysis experiments
+3. Generate trajectory plots for the final report

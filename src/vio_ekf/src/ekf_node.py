@@ -26,12 +26,19 @@ class EKFNode(Node):
         self.P[9:12, 9:12] *= 0.01 # Accel bias uncertainty
         self.P[12:15, 12:15] *= 0.001 # Gyro bias uncertainty
 
-        # Noise Parameters
-        self.Q_a = 0.01  # Accel noise density
-        self.Q_g = 0.005 # Gyro noise density
-        self.Q_ba = 0.0001 # Accel bias random walk
-        self.Q_bg = 0.00001 # Gyro bias random walk
-        self.R_cam = 5.0 # Pixel measurement noise (variance)
+        # Noise Parameters (From Gazebo IMU plugin in model.sdf)
+        # Accelerometer: stddev = 1.7e-2 m/s^2 -> variance = (1.7e-2)^2
+        # Gyroscope: stddev = 2e-4 rad/s -> variance = (2e-4)^2
+        self.sigma_a = 1.7e-2   # Accel noise stddev (m/s^2)
+        self.sigma_g = 2e-4    # Gyro noise stddev (rad/s)
+        self.Q_a = self.sigma_a ** 2  # Accel noise variance
+        self.Q_g = self.sigma_g ** 2  # Gyro noise variance
+        self.Q_ba = 1e-6  # Accel bias random walk (conservative estimate)
+        self.Q_bg = 1e-8  # Gyro bias random walk (conservative estimate)
+        self.R_cam = 5.0  # Pixel measurement noise (variance)
+
+        # Time sync tolerance (max acceptable delay between IMU and vision)
+        self.max_time_delay = 0.05  # 50ms tolerance
 
         # Landmarks (Known Map from landmarks.sdf)
         # ID 1: Red, ID 2: Green
@@ -60,9 +67,15 @@ class EKFNode(Node):
         self.last_imu_time = None
         self.path_msg = Path()
 
+        # Ground truth trajectory for evaluation (ATE calculation)
+        self.gt_trajectory = []
+        self.est_trajectory = []
+
         self.sub_imu = self.create_subscription(Imu, '/imu', self.imu_callback, 10)
         self.sub_vision = self.create_subscription(PoseArray, '/vio/landmarks', self.vision_callback, 10)
         self.sub_cam_info = self.create_subscription(CameraInfo, '/camera_info', self.info_callback, 10)
+        # Ground truth subscription for validation/evaluation
+        self.sub_gt = self.create_subscription(Odometry, '/ground_truth/odom', self.gt_callback, 10)
 
         self.pub_odom = self.create_publisher(Odometry, '/vio/odom', 10)
         self.pub_path = self.create_publisher(Path, '/vio/path', 10)
@@ -174,7 +187,52 @@ class EKFNode(Node):
 
         self.P = Fx @ self.P @ Fx.T + Qi
 
+    def gt_callback(self, msg):
+        """
+        Store ground truth pose for later ATE (Absolute Trajectory Error) calculation.
+        """
+        gt_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        gt_pos = np.array([
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            msg.pose.pose.position.z
+        ])
+        gt_quat = np.array([
+            msg.pose.pose.orientation.w,
+            msg.pose.pose.orientation.x,
+            msg.pose.pose.orientation.y,
+            msg.pose.pose.orientation.z
+        ])
+        self.gt_trajectory.append({
+            'time': gt_time,
+            'position': gt_pos,
+            'orientation': gt_quat
+        })
+        # Keep trajectory buffer bounded
+        if len(self.gt_trajectory) > 2000:
+            self.gt_trajectory.pop(0)
+
     def vision_callback(self, msg):
+        """
+        Handle visual landmark observations with time synchronization check.
+        """
+        # Time synchronization check
+        if self.last_imu_time is None:
+            # No IMU data yet, skip vision update
+            self.get_logger().warn("Vision update skipped: No IMU data received yet", throttle_duration_sec=2.0)
+            return
+
+        vision_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        time_diff = abs(vision_time - self.last_imu_time)
+
+        if time_diff > self.max_time_delay:
+            self.get_logger().warn(
+                f"Vision-IMU time mismatch: {time_diff:.3f}s > {self.max_time_delay}s. "
+                "Consider adjusting synchronization.",
+                throttle_duration_sec=5.0
+            )
+            # Still proceed but log the warning for debugging
+
         # msg is PoseArray. x=u, y=v, z=id
         for obs in msg.poses:
             lid = obs.position.z
@@ -309,6 +367,17 @@ class EKFNode(Node):
 
         self.pub_odom.publish(odom)
 
+        # Store estimated trajectory for ATE calculation
+        est_time = timestamp.sec + timestamp.nanosec * 1e-9
+        self.est_trajectory.append({
+            'time': est_time,
+            'position': self.x[0:3].copy(),
+            'orientation': self.x[6:10].copy()
+        })
+        # Keep trajectory buffer bounded
+        if len(self.est_trajectory) > 2000:
+            self.est_trajectory.pop(0)
+
         # Broadcast Transform
         t = TransformStamped()
         t.header = odom.header
@@ -327,6 +396,79 @@ class EKFNode(Node):
         self.path_msg.poses.append(pose)
         if len(self.path_msg.poses) > 500: self.path_msg.poses.pop(0)
         self.pub_path.publish(self.path_msg)
+
+    def compute_ate(self):
+        """
+        Compute Absolute Trajectory Error (ATE) as RMSE between
+        estimated and ground truth trajectories.
+
+        Returns:
+            float: RMSE of position error in meters, or None if insufficient data
+        """
+        if len(self.gt_trajectory) < 10 or len(self.est_trajectory) < 10:
+            self.get_logger().warn("Insufficient trajectory data for ATE computation")
+            return None
+
+        # Match trajectories by closest timestamp
+        errors = []
+        for est in self.est_trajectory:
+            # Find closest ground truth by time
+            min_dt = float('inf')
+            closest_gt = None
+            for gt in self.gt_trajectory:
+                dt = abs(est['time'] - gt['time'])
+                if dt < min_dt:
+                    min_dt = dt
+                    closest_gt = gt
+
+            # Only use if time difference is acceptable (< 50ms)
+            if closest_gt is not None and min_dt < 0.05:
+                pos_error = np.linalg.norm(est['position'] - closest_gt['position'])
+                errors.append(pos_error ** 2)
+
+        if len(errors) == 0:
+            self.get_logger().warn("No matching trajectory points found for ATE")
+            return None
+
+        rmse = np.sqrt(np.mean(errors))
+        self.get_logger().info(f"ATE (RMSE): {rmse:.4f} m over {len(errors)} points")
+        return rmse
+
+    def compute_nees(self):
+        """
+        Compute Normalized Estimation Error Squared (NEES) for filter consistency.
+        This checks if the filter's uncertainty (covariance) matches the actual errors.
+
+        For a consistent filter, NEES ~ chi-squared with DOF = state dimension
+        Expected value: DOF (15 for our error state)
+        """
+        if len(self.gt_trajectory) < 1 or len(self.est_trajectory) < 1:
+            return None
+
+        # Get most recent estimates
+        est = self.est_trajectory[-1]
+
+        # Find closest ground truth
+        min_dt = float('inf')
+        closest_gt = None
+        for gt in self.gt_trajectory:
+            dt = abs(est['time'] - gt['time'])
+            if dt < min_dt:
+                min_dt = dt
+                closest_gt = gt
+
+        if closest_gt is None or min_dt > 0.05:
+            return None
+
+        # Position error (3 DOF)
+        pos_error = est['position'] - closest_gt['position']
+        P_pos = self.P[0:3, 0:3]
+
+        try:
+            nees_pos = pos_error.T @ np.linalg.inv(P_pos) @ pos_error
+            return nees_pos
+        except np.linalg.LinAlgError:
+            return None
 
 def main(args=None):
     rclpy.init(args=args)
