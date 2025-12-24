@@ -139,6 +139,8 @@
         </material>
       </visual>
 
+      <!-- LIDAR sensor disabled for VIO project (using only IMU + Camera) -->
+      <!--
       <sensor name="lidar" type="gpu_lidar">
         <always_on>true</always_on>
         <visualize>true</visualize>
@@ -166,6 +168,7 @@
           </noise>
         </lidar>
       </sensor>
+      -->
     </link>
 
     <link name="wheel_left_link">

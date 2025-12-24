@@ -38,8 +38,6 @@ def generate_launch_description():
         # Camera image and camera_info (GZ -> ROS)
         '/camera@sensor_msgs/msg/Image@ignition.msgs.Image',
         '/camera_info@sensor_msgs/msg/CameraInfo@ignition.msgs.CameraInfo',
-        # LiDAR (GZ -> ROS)
-        '/scan@sensor_msgs/msg/LaserScan@ignition.msgs.LaserScan',
         # Ground-truth poses (GZ -> ROS) - Bridge Pose_V to TFMessage
         '/model/turtlebot3/pose@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
         '/model/turtlebot3/pose_static@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V',
@@ -49,6 +47,8 @@ def generate_launch_description():
         '/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist',
         # Clock (GZ -> ROS) - required for use_sim_time
         '/clock@rosgraph_msgs/msg/Clock@ignition.msgs.Clock',
+        # Joint states for robot_state_publisher
+        '/joint_states@sensor_msgs/msg/JointState@ignition.msgs.Model',
     ]
     bridge = Node(
         package='ros_gz_bridge',
@@ -95,11 +95,27 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Robot State Publisher (reads URDF and publishes TF for robot links)
+    urdf_file = os.path.join(pkg_vio, 'urdf', 'turtlebot3_waffle_pi.urdf')
+    with open(urdf_file, 'r') as f:
+        robot_desc = f.read()
+
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'robot_description': robot_desc,
+        }],
+    )
+
     #  Rviz2
     rviz = Node(
         package='rviz2',
         executable='rviz2',
-        # arguments=['-d', os.path.join(pkg_vio, 'rviz', 'vio.rviz')], # Enable once we save a config
+        arguments=['-d', os.path.join(pkg_vio, 'rviz', 'vio.rviz')],
         parameters=[{'use_sim_time': True}],
         output='screen'
     )
@@ -110,6 +126,7 @@ def generate_launch_description():
         executable='vision_node.py',
         name='vision_node',
         output='screen',
+        parameters=[{'use_sim_time': True}],
     )
 
     ekf_node = Node(
@@ -117,6 +134,7 @@ def generate_launch_description():
         executable='ekf_node.py',
         name='ekf_node',
         output='screen',
+        parameters=[{'use_sim_time': True}],
     )
 
     return LaunchDescription([
@@ -126,6 +144,7 @@ def generate_launch_description():
         bridge,
         ground_truth,
         tf_world_to_model,
+        robot_state_publisher,
         ekf_node,
         cam_tf,
         vision_node,
