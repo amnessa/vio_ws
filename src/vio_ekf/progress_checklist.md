@@ -1,35 +1,68 @@
-Project 3: Visual-Inertial EKF Navigation Checklist
+**Project 3: Visual-Inertial ES-EKF Navigation Checklist**
 
-Phase 1: Environment Setup (Simulated World)
+**Phase 1: Environment Setup (Simulated World)**
 
-[x] Build Package: Create the vio_ekf ROS2 package structure. (In Progress)
+* [x] **Build Package:** Create the `vio_ekf` ROS2 package structure.
+* [x] **World:** Verify `landmarks.sdf` loads in Gazebo Fortress with colored cylinders.
+* [x] **Robot:** Verify the robot spawns with IMU/Camera plugins loaded.
+* [x] **Sensors:** Check topics `/imu` and `/camera` via `ros2 topic list`.
+* [x] **Ground Truth:** Verify `pose_tf_broadcaster` is publishing TFs from Map -> Odom -> Base.
 
-[x] World: Verify landmarks.sdf loads in Gazebo Fortress with colored cylinders.
+**Phase 2: Visual Frontend (Visual Data Processing)**
 
-[x] Robot: Verify the robot spawns with IMU/Camera plugins loaded.
+* [x] **Feature Extraction:** Implement simple color thresholding in `vision_node.py`.
 
-[x] Sensors: Check topics /imu and /camera via ros2 topic list.
 
-[x] Ground Truth: Verify pose_tf_broadcaster is publishing TFs from Map -> Odom -> Base.
+* [ ] **Pose Estimation:** Ensure vision node outputs an estimated pose or pixel coordinates ready for the EKF update.
 
-Phase 2: Visual Frontend (The Eyes)
 
-[x] Feature Extraction: Implement simple color thresholding in vision_node.py.
+* [ ] **Data Synchronization:** Ensure visual detection messages and IMU data are time-synced for the filter.
 
-[ ] Data Association: For this phase, we assume Known Correspondence (Red=1, Green=2).
 
-[ ] Test: Echo /vio/landmarks. Do pixel coordinates change as you move?
 
-Phase 3: The EKF Backend (The Brain)
+**Phase 3: The ES-EKF Backend (Implementation)**
 
-[ ] State Vector: Define 16-element state: $[p, v, q, b_a, b_g]$.
+* [ ] **State Structures:** Define classes for Nominal State () and Error State ().
 
-[ ] Prediction Step (IMU): Dead Reckoning implementation.
 
-[ ] Update Step (Vision): Jacobian $H$ and Innovation.
+* [ ] **Prediction Step (IMU):**
+* [ ] Implement Runge-Kutta or Euler integration for Nominal State.
 
-[ ] Bias Estimation: Monitor convergence of $b_a, b_g$.
 
-Phase 4: Analysis
+* [ ] Compute Jacobian  and propagate Covariance .
 
-[ ] Comparison: Compare Dead Reckoning vs. VIO vs. Ground Truth.
+
+
+
+* [ ] **Update Step (Vision):**
+* [ ] Compute Jacobian  (observation w.r.t error state).
+
+
+* [ ] Compute Kalman Gain  and estimate error state .
+
+
+
+
+* [ ] **Injection & Reset:** Implement the injection of  into  and reset  to zero.
+
+
+* [ ] **Bias Initialization:** Ensure biases  are initialized and estimated correctly.
+
+
+
+**Phase 4: Evaluation & Analysis**
+
+* [ ] **Trajectory Validation:** Plot Estimated Path vs. Ground Truth.
+
+
+* [ ] **ATE Metric:** Calculate Absolute Trajectory Error (RMSE).
+
+
+* [ ] **NEES Metric:** Calculate Normalized Estimation Error Squared to verify filter consistency.
+
+
+* [ ] **Drift Analysis:** Compare "IMU Only" (Dead Reckoning) vs. "Visual-Inertial" (Fusion) modes.
+
+
+
+**Next Step:** Would you like to start implementing the **State Structures** for the ES-EKF (Phase 3), or should we finalize the **Visual Frontend** (Phase 2) data synchronization first?
