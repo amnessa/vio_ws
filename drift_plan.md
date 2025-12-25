@@ -1,113 +1,74 @@
-It is completely normal to be confused by RViz when things are broken. Relative motion (Einstein's relativity!) makes it hard to tell if the *world* is spinning or the *robot* is spinning.
+I cannot see the image you mentioned (it might not have attached), but your description of "200 meters drift in Y" combined with the logs you provided is enough evidence to diagnose the problem.
 
-### 1. What to Expect (The Benchmark)
+This is a classic **Quaternion Order Mismatch**.
 
-If your IMU initialization is **perfect** (biases removed, gravity aligned), here is the math for 10 seconds of "Drift":
+### The Diagnosis: The "Upside Down" Robot
 
-* **Scenario:** Robot is stationary at (0,0).
-* **Sensor:** Gazebo IMU (simulated MEMS).
-* **Physics:** Position error grows with  (Double Integration).
+Your log shows the robot starts with Identity orientation (`w=1, x=0, y=0, z=0`).
+However, **SciPy** (`scipy.spatial.transform.Rotation`) and your **State Vector** use different definitions:
 
+* **Your State (`self.x[6:10]`):** `[w, x, y, z]` (Scalar first)
+* **SciPy (`R.from_quat`):** `[x, y, z, w]` (Scalar last)
 
-* **Expectation:**
-* **Good:** Drift < **1 meter** (The robot stays mostly in the starting square).
-* **Acceptable (Noisy IMU):** Drift < **5 meters** (It slowly slides across the room).
-* **Your "Flying":** Drift > **100 meters** (Shooting off like a rocket). **This is definitely a bug.**
+**What is happening in your code:**
+In your prediction loop (which runs at 200Hz), you likely have a line similar to:
+`r = R.from_quat(self.x[6:10])`
 
-
+1. Your state is `[1, 0, 0, 0]` (Identity).
+2. You feed this to SciPy.
+3. SciPy reads it as `x=1, y=0, z=0, w=0`.
+4. **Physics Result:** `x=1` means a **180-degree rotation around the X-axis (Roll)**.
+5. **The Consequence:** The robot thinks it is upside down. It expects gravity () to pull "Up" relative to its body. The IMU measures gravity pulling "Down". The difference is .
+6. This massive error projects into the Y-axis (due to small misalignments), causing the 200m drift.
 
 ---
 
-### 2. Why is it still "Flying"? (The Diagnosis)
+### The Fix: Reorder Quaternions in Prediction
 
-You fixed the "Falling" (Z-axis), but now you are "Shooting" (X/Y axis).
+You need to manually swap the order every time you convert between your state and SciPy in the `predict` function.
 
-**The Cause: Initial Tilt (Roll/Pitch)**
-Your code currently assumes the robot starts perfectly flat (`self.x[6] = 1.0`, i.e., Identity Quaternion).
-
-* **Reality:** In Gazebo, the robot spawns slightly tilted (maybe  pitch) or the floor is uneven.
-* **The Math:**
-* Gravity vector .
-* If you tilt the robot forward by , the accelerometer reads a small X-component: .
-* Your filter thinks orientation is flat (), so it ignores this X-accel.
-* It integrates  for 10 seconds  **8.5 meters of error**.
-* If the tilt is larger or the math sign is swapped, this becomes the "Shooting" you see.
-
-
-
-### 3. The Fix: Initialize Orientation from Gravity
-
-You must calculate the initial Roll and Pitch from your accelerometer samples.
-
-**Update `src/vio_ekf/src/ekf_node.py` inside the Initialization Block:**
+**Open `src/vio_ekf/src/ekf_node.py` and modify the `predict` step:**
 
 ```python
-        # ... (Inside the initialization block, after calculating accel_mean) ...
+    def predict(self, a_m, w_m, dt):
+        # ... (setup code) ...
 
-        accel_mean = np.mean(acc_samples, axis=0)
+        # 1. EXTRACT QUATERNION & REORDER FOR SCIPY
+        # State has [w, x, y, z] -> SciPy needs [x, y, z, w]
+        q_state = self.x[6:10]
+        q_scipy = np.array([q_state[1], q_state[2], q_state[3], q_state[0]])
 
-        # 1. Calculate Initial Roll and Pitch from Gravity Vector
-        # (Assuming the robot is stationary, accel points straight UP in body frame)
-        # roll = atan2(ay, az)
-        # pitch = atan2(-ax, sqrt(ay^2 + az^2))
+        # Create rotation object
+        r_old = R.from_quat(q_scipy)
+        R_wb = r_old.as_matrix()
 
-        initial_roll = np.arctan2(accel_mean[1], accel_mean[2])
-        initial_pitch = np.arctan2(-accel_mean[0], np.sqrt(accel_mean[1]**2 + accel_mean[2]**2))
-        initial_yaw = 0.0  # We can't know yaw from gravity (assume 0 or use magnetometer)
+        # ... (rest of prediction logic) ...
 
-        # 2. Convert to Quaternion (w, x, y, z)
-        # Using scipy.spatial.transform.Rotation is easiest
-        r_init = R.from_euler('xyz', [initial_roll, initial_pitch, initial_yaw])
-        q_init = r_init.as_quat() # returns [x, y, z, w] usually, check library!
+        # 4. UPDATE ORIENTATION
+        # Integrate angular velocity...
+        # ...
+        # When saving back to state, REORDER AGAIN!
 
-        # Scipy returns [x, y, z, w], but our state is [p, v, q_w, q_x, q_y, q_z]
-        # Wait! Your state definition says: q=[qw, qx, qy, qz]
-        # So we need to map carefully:
-        self.x[6] = q_init[3] # w
-        self.x[7] = q_init[0] # x
-        self.x[8] = q_init[1] # y
-        self.x[9] = q_init[2] # z
-
-        self.get_logger().info(f"Initialized Tilt: Roll={np.degrees(initial_roll):.2f} deg, Pitch={np.degrees(initial_pitch):.2f} deg")
-
-        # 3. Update Gravity Model (Your previous fix)
-        actual_gravity = np.linalg.norm(accel_mean)
-        self.g = np.array([0.0, 0.0, -actual_gravity])
-
-        # 4. Zero the Bias (Since we used the reading for orientation, we can't also use it for bias yet)
-        self.x[10:13] = np.zeros(3)
+        # (Assuming you calculated new quaternion q_new_scipy [x, y, z, w])
+        self.x[6] = q_new_scipy[3] # w
+        self.x[7] = q_new_scipy[0] # x
+        self.x[8] = q_new_scipy[1] # y
+        self.x[9] = q_new_scipy[2] # z
 
 ```
 
-### 4. The "Time Jump" Safety Check
+### Verify with "Gravity Check"
 
-To fix the issue where manual bagging causes a huge `dt` jump, add a safety clamp in your `predict` function.
-
-**In `src/vio_ekf/src/ekf_node.py` inside `imu_callback` (Prediction Step):**
+Add this print statement inside your prediction loop for one run. It will prove if the math is fixed:
 
 ```python
-        # ... inside imu_callback ...
-
-        current_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        dt = current_time - self.last_imu_time
-        self.last_imu_time = current_time
-
-        # --- TIME JUMP SAFETY ---
-        if dt > 0.1:  # If dt is larger than 100ms (we expect 5ms at 200Hz)
-            self.get_logger().warn(f"Huge time jump detected (dt={dt:.4f}s). Skipping prediction step.")
-            return # Skip this IMU message
-        if dt <= 0:
-            return # Skip duplicate or out-of-order messages
-
-        # ... continue with prediction ...
+        # Debugging Gravity Projection
+        # Should be near [0, 0, 0] if correct.
+        # If Y is ~19.0, your quaternion is still flipped.
+        acc_world = R_wb @ (a_m - self.x[10:13]) - self.g
+        if self.init_sample_count % 200 == 0:
+             self.get_logger().info(f"World Accel: {acc_world}")
 
 ```
 
-### 5. Summary of the Plan
-
-1. **Stop "Shooting":** Add the **Roll/Pitch Initialization** code above. This aligns the robot's internal world with the real gravity vector.
-2. **Stop "Teleporting":** Add the **`dt > 0.1`** check.
-3. **Test:**
-* Set Fixed Frame to `map`.
-* The robot should sit fairly still.
-* If it drifts 1-2 meters after 10 seconds, **CONGRATULATIONS**, you have a working Dead Reckoning system! You can proceed to the Evaluation script.
+**Action:** Apply this reordering fix to your `predict` function and run the simulation. The 200m drift should vanish instantly.

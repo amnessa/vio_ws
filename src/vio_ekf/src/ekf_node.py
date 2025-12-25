@@ -35,15 +35,18 @@ class EKFNode(Node):
         self.P[12:15, 12:15] *= 0.001 # Gyro bias uncertainty
 
         # Noise Parameters - Updated based on observed IMU statistics
-        # From initialization: accel_std ~0.1 m/s^2, gyro_std ~0.05 rad/s (Y axis)
+        # From initialization: accel_std ~0.07 m/s^2, gyro_std ~0.026 rad/s (Y axis has 100x more!)
         # These are higher than datasheet due to Gazebo simulation noise
-        self.sigma_a = 0.15     # Accel noise stddev (m/s^2) - conservative based on observed
-        self.sigma_g = 0.01     # Gyro noise stddev (rad/s) - conservative based on observed
+        self.sigma_a = 0.2      # Accel noise stddev (m/s^2) - conservative
+        self.sigma_g = 0.03     # Gyro noise stddev (rad/s) - matches observed Y-axis std
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 1e-4  # Accel bias random walk (increased for faster adaptation)
-        self.Q_bg = 1e-5  # Gyro bias random walk (increased for faster adaptation)
+        self.Q_ba = 1e-4  # Accel bias random walk
+        self.Q_bg = 1e-4  # Gyro bias random walk (increased to allow faster adaptation)
         self.R_cam = 5.0  # Pixel measurement noise (variance)
+
+        # Gravity correction gain (for attitude correction from accelerometer)
+        self.gravity_correction_gain = 0.05  # Increased gain for faster correction
 
         # Time sync tolerance (max acceptable delay between IMU and vision)
         self.max_time_delay = 0.05  # 50ms tolerance
@@ -257,6 +260,16 @@ class EKFNode(Node):
         w_unbiased = w_m - bg
         # Use calibrated gravity from initialization (not hardcoded 9.81)
 
+        # --- GRAVITY CHECK DEBUG ---
+        # This should be near [0, 0, 0] when stationary if quaternion is correct.
+        # If any component is large (~10-20), the quaternion order is wrong.
+        acc_world = R_wb @ a_unbiased - self.g
+        if not hasattr(self, '_debug_counter'):
+            self._debug_counter = 0
+        self._debug_counter += 1
+        if self._debug_counter % 400 == 1:  # Log every 2 seconds at 200Hz
+            self.get_logger().info(f"World Accel (should be ~0): [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2")
+
         # Position
         p_new = p + v * dt + 0.5 * (R_wb @ a_unbiased - self.g) * dt**2
         # Velocity
@@ -319,6 +332,36 @@ class EKFNode(Node):
         Qi[12:15, 12:15] = np.eye(3) * self.Q_bg * dt # bg random walk
 
         self.P = Fx @ self.P @ Fx.T + Qi
+
+        # --- GRAVITY-BASED ATTITUDE CORRECTION ---
+        # Use accelerometer to provide roll/pitch reference (complementary filter style)
+        # This prevents gyro noise from accumulating into orientation drift
+        # Only apply when acceleration magnitude is close to gravity (not accelerating)
+        accel_magnitude = np.linalg.norm(a_unbiased)
+        if abs(accel_magnitude - self.gravity_magnitude) < 0.5:  # Within 0.5 m/s^2 of gravity
+            # Current gravity estimate in world frame
+            gravity_world_est = R_wb @ a_unbiased
+
+            # Expected gravity direction (up)
+            gravity_world_expected = self.g
+
+            # Compute attitude error as cross product (small angle approximation)
+            # This gives us the rotation needed to align estimated gravity with expected
+            gravity_error = np.cross(gravity_world_est / accel_magnitude,
+                                     gravity_world_expected / self.gravity_magnitude)
+
+            # Apply small correction to orientation (complementary filter)
+            # Only correct roll and pitch (indices 0, 1), not yaw (index 2)
+            correction = self.gravity_correction_gain * gravity_error
+            correction[2] = 0  # Don't correct yaw from gravity
+
+            # Apply correction via quaternion
+            if np.linalg.norm(correction) > 1e-8:
+                dq_correction = R.from_rotvec(correction)
+                q_curr = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])
+                q_corrected = q_curr * dq_correction
+                q_new_corr = q_corrected.as_quat()
+                self.x[6:10] = np.array([q_new_corr[3], q_new_corr[0], q_new_corr[1], q_new_corr[2]])
 
     def gt_callback(self, msg):
         """
