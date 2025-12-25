@@ -17,8 +17,9 @@ class EKFNode(Node):
         # Collect IMU samples while stationary to estimate biases and initial orientation
         self.initialized = False
         self.init_samples = []
-        self.init_sample_count = 400  # Number of samples to collect (at 200Hz = 2 seconds)
-        self.gravity_magnitude = 9.81  # Expected gravity magnitude
+        self.init_sample_count = 800  # Number of samples to collect (at 200Hz = 4 seconds)
+        self.gravity_magnitude = 9.81  # Expected gravity magnitude (will be updated from IMU)
+        self.g = np.array([0.0, 0.0, 9.81])  # Gravity vector in world frame (will be updated)
 
         # --- State Definitions ---
         # State: [p(3), v(3), q(4), ba(3), bg(3)] = 16 elements
@@ -118,7 +119,16 @@ class EKFNode(Node):
             return
 
         dt = curr_time - self.last_imu_time
-        if dt <= 0: return # Skip backwards or duplicate messages
+
+        # --- TIME JUMP SAFETY ---
+        # If dt is larger than 100ms (we expect ~5ms at 200Hz), skip this message
+        # This prevents huge integration errors from bag file jumps or pauses
+        if dt > 0.1:
+            self.get_logger().warn(f"Huge time jump detected (dt={dt:.4f}s). Skipping prediction step.")
+            self.last_imu_time = curr_time
+            return
+        if dt <= 0:
+            return # Skip backwards or duplicate messages
         self.last_imu_time = curr_time
 
         # --- PREDICTION STEP ---
@@ -199,15 +209,29 @@ class EKFNode(Node):
         q_scipy = rot.as_quat()  # [x, y, z, w]
         self.x[6:10] = np.array([q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]])
 
-        # --- Accelerometer Bias ---
-        # After accounting for gravity and orientation, remaining error is bias
-        # Expected reading when stationary: R_wb^T @ [0, 0, g]
-        expected_accel = R_init.T @ np.array([0, 0, self.gravity_magnitude])
-        accel_bias = accel_mean - expected_accel
-        self.x[10:13] = accel_bias  # ba
+        # --- Update Gravity Model ---
+        # Use the ACTUAL measured magnitude instead of hardcoded 9.81
+        # This ensures (R @ accel - gravity) is exactly zero when stationary
+        actual_gravity = np.linalg.norm(accel_mean)
+        self.gravity_magnitude = actual_gravity
+        self.g = np.array([0.0, 0.0, actual_gravity])
+        self.get_logger().info(f"Updated Gravity Model: {actual_gravity:.4f} m/s^2")
 
+        # --- Accelerometer Bias ---
+        # CRITICAL: Set bias to ZERO!
+        # The X/Y components of accel_mean are already explained by the orientation
+        # we just computed from gravity. If we also subtract them as bias, we
+        # double-compensate and create false acceleration.
+        #
+        # The filter will estimate any true sensor bias over time.
+        self.x[10:13] = np.zeros(3)
+
+        # Log the computed initial tilt for debugging
+        initial_roll = np.arctan2(accel_mean[1], accel_mean[2])
+        initial_pitch = np.arctan2(-accel_mean[0], np.sqrt(accel_mean[1]**2 + accel_mean[2]**2))
+        self.get_logger().info(f"Initial tilt: Roll={np.degrees(initial_roll):.2f} deg, Pitch={np.degrees(initial_pitch):.2f} deg")
         self.get_logger().info(f"Initial orientation (quat): w={self.x[6]:.4f}, x={self.x[7]:.4f}, y={self.x[8]:.4f}, z={self.x[9]:.4f}")
-        self.get_logger().info(f"Accel bias: [{accel_bias[0]:.4f}, {accel_bias[1]:.4f}, {accel_bias[2]:.4f}] m/s^2")
+        self.get_logger().info(f"Accel bias: [{self.x[10]:.4f}, {self.x[11]:.4f}, {self.x[12]:.4f}] m/s^2 (all zero)")
         self.get_logger().info(f"Gyro bias:  [{gyro_mean[0]:.6f}, {gyro_mean[1]:.6f}, {gyro_mean[2]:.6f}] rad/s")
 
         # Clear init samples
@@ -231,12 +255,12 @@ class EKFNode(Node):
         # Bias corrected measurements
         a_unbiased = a_m - ba
         w_unbiased = w_m - bg
-        g = np.array([0, 0, 9.81]) # Gravity in World
+        # Use calibrated gravity from initialization (not hardcoded 9.81)
 
         # Position
-        p_new = p + v * dt + 0.5 * (R_wb @ a_unbiased - g) * dt**2
+        p_new = p + v * dt + 0.5 * (R_wb @ a_unbiased - self.g) * dt**2
         # Velocity
-        v_new = v + (R_wb @ a_unbiased - g) * dt
+        v_new = v + (R_wb @ a_unbiased - self.g) * dt
         # Orientation (Quaternion integration)
         # exp_map for rotation vector w * dt
         w_norm = np.linalg.norm(w_unbiased)
