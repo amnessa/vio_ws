@@ -13,6 +13,13 @@ class EKFNode(Node):
     def __init__(self):
         super().__init__('ekf_node')
 
+        # --- Initialization Phase ---
+        # Collect IMU samples while stationary to estimate biases and initial orientation
+        self.initialized = False
+        self.init_samples = []
+        self.init_sample_count = 400  # Number of samples to collect (at 200Hz = 2 seconds)
+        self.gravity_magnitude = 9.81  # Expected gravity magnitude
+
         # --- State Definitions ---
         # State: [p(3), v(3), q(4), ba(3), bg(3)] = 16 elements
         # Error State: [dp(3), dv(3), dtheta(3), dba(3), dbg(3)] = 15 elements
@@ -21,20 +28,20 @@ class EKFNode(Node):
 
         # Covariance Matrix (15x15)
         self.P = np.eye(15) * 0.1
-        self.P[0:3, 0:3] *= 0.0  # Known initial position
+        self.P[0:3, 0:3] *= 0.01  # Small initial position uncertainty
         self.P[6:9, 6:9] *= 0.01 # Initial orientation uncertainty
         self.P[9:12, 9:12] *= 0.01 # Accel bias uncertainty
         self.P[12:15, 12:15] *= 0.001 # Gyro bias uncertainty
 
-        # Noise Parameters (From Gazebo IMU plugin in model.sdf)
-        # Accelerometer: stddev = 1.7e-2 m/s^2 -> variance = (1.7e-2)^2
-        # Gyroscope: stddev = 2e-4 rad/s -> variance = (2e-4)^2
-        self.sigma_a = 1.7e-2   # Accel noise stddev (m/s^2)
-        self.sigma_g = 2e-4    # Gyro noise stddev (rad/s)
+        # Noise Parameters - Updated based on observed IMU statistics
+        # From initialization: accel_std ~0.1 m/s^2, gyro_std ~0.05 rad/s (Y axis)
+        # These are higher than datasheet due to Gazebo simulation noise
+        self.sigma_a = 0.15     # Accel noise stddev (m/s^2) - conservative based on observed
+        self.sigma_g = 0.01     # Gyro noise stddev (rad/s) - conservative based on observed
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 1e-6  # Accel bias random walk (conservative estimate)
-        self.Q_bg = 1e-8  # Gyro bias random walk (conservative estimate)
+        self.Q_ba = 1e-4  # Accel bias random walk (increased for faster adaptation)
+        self.Q_bg = 1e-5  # Gyro bias random walk (increased for faster adaptation)
         self.R_cam = 5.0  # Pixel measurement noise (variance)
 
         # Time sync tolerance (max acceptable delay between IMU and vision)
@@ -88,6 +95,22 @@ class EKFNode(Node):
         self.K = np.array(msg.k).reshape(3,3)
 
     def imu_callback(self, msg):
+        # Extract measurements
+        a_m = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
+        w_m = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
+
+        # --- INITIALIZATION PHASE ---
+        # Collect samples while robot is stationary to estimate biases and initial orientation
+        if not self.initialized:
+            self.init_samples.append({'accel': a_m.copy(), 'gyro': w_m.copy()})
+
+            if len(self.init_samples) >= self.init_sample_count:
+                self.initialize_from_imu()
+            else:
+                if len(self.init_samples) % 20 == 0:
+                    self.get_logger().info(f"Initializing... {len(self.init_samples)}/{self.init_sample_count} samples")
+            return
+
         curr_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
         if self.last_imu_time is None:
@@ -98,13 +121,99 @@ class EKFNode(Node):
         if dt <= 0: return # Skip backwards or duplicate messages
         self.last_imu_time = curr_time
 
-        # Extract measurements
-        a_m = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
-        w_m = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
-
         # --- PREDICTION STEP ---
         self.predict(dt, a_m, w_m)
         self.publish_state(msg.header.stamp)
+
+    def initialize_from_imu(self):
+        """
+        Initialize the EKF state from stationary IMU readings.
+
+        1. Average gyro readings to get gyroscope bias
+        2. Average accel readings to get gravity direction + accel bias
+        3. Compute initial orientation from gravity vector
+        """
+        self.get_logger().info("Computing initial biases from IMU samples...")
+
+        # Stack all samples
+        accels = np.array([s['accel'] for s in self.init_samples])
+        gyros = np.array([s['gyro'] for s in self.init_samples])
+
+        # Average readings (should be stationary)
+        accel_mean = np.mean(accels, axis=0)
+        gyro_mean = np.mean(gyros, axis=0)
+
+        # Check if readings are consistent (low variance = stationary)
+        accel_std = np.std(accels, axis=0)
+        gyro_std = np.std(gyros, axis=0)
+
+        self.get_logger().info(f"Accel mean: [{accel_mean[0]:.4f}, {accel_mean[1]:.4f}, {accel_mean[2]:.4f}] m/s^2")
+        self.get_logger().info(f"Accel std:  [{accel_std[0]:.4f}, {accel_std[1]:.4f}, {accel_std[2]:.4f}] m/s^2")
+        self.get_logger().info(f"Gyro mean:  [{gyro_mean[0]:.6f}, {gyro_mean[1]:.6f}, {gyro_mean[2]:.6f}] rad/s")
+        self.get_logger().info(f"Gyro std:   [{gyro_std[0]:.6f}, {gyro_std[1]:.6f}, {gyro_std[2]:.6f}] rad/s")
+
+        # --- Gyroscope Bias ---
+        # When stationary, gyro should read zero. Any reading is bias.
+        self.x[13:16] = gyro_mean  # bg = gyro_mean
+
+        # --- Initial Orientation from Gravity ---
+        # The accelerometer measures the reaction to gravity.
+        # When stationary: a_measured = R_wb^T @ [0, 0, g] (assuming world Z is up)
+        # So the gravity vector in body frame tells us the orientation.
+
+        accel_norm = np.linalg.norm(accel_mean)
+        if abs(accel_norm - self.gravity_magnitude) > 1.0:
+            self.get_logger().warn(f"Accel magnitude {accel_norm:.2f} differs from expected {self.gravity_magnitude:.2f}")
+
+        # Normalize to get gravity direction in body frame
+        gravity_body = accel_mean / accel_norm
+
+        # Gravity in world frame (pointing UP, since accelerometer measures reaction)
+        gravity_world = np.array([0.0, 0.0, 1.0])
+
+        # Find rotation that aligns gravity_body with gravity_world
+        # This gives us R_wb (rotation from body to world)
+        # Using Rodrigues' formula: find axis-angle from cross product
+
+        v = np.cross(gravity_body, gravity_world)
+        s = np.linalg.norm(v)  # sin(angle)
+        c = np.dot(gravity_body, gravity_world)  # cos(angle)
+
+        if s < 1e-6:
+            # Vectors are parallel
+            if c > 0:
+                # Already aligned, identity rotation
+                R_init = np.eye(3)
+            else:
+                # Opposite direction, 180 degree rotation around X
+                R_init = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        else:
+            # Rodrigues formula: R = I + [v]_x + [v]_x^2 * (1-c)/s^2
+            vx = np.array([[0, -v[2], v[1]],
+                           [v[2], 0, -v[0]],
+                           [-v[1], v[0], 0]])
+            R_init = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+        # Convert to quaternion [w, x, y, z]
+        rot = R.from_matrix(R_init)
+        q_scipy = rot.as_quat()  # [x, y, z, w]
+        self.x[6:10] = np.array([q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]])
+
+        # --- Accelerometer Bias ---
+        # After accounting for gravity and orientation, remaining error is bias
+        # Expected reading when stationary: R_wb^T @ [0, 0, g]
+        expected_accel = R_init.T @ np.array([0, 0, self.gravity_magnitude])
+        accel_bias = accel_mean - expected_accel
+        self.x[10:13] = accel_bias  # ba
+
+        self.get_logger().info(f"Initial orientation (quat): w={self.x[6]:.4f}, x={self.x[7]:.4f}, y={self.x[8]:.4f}, z={self.x[9]:.4f}")
+        self.get_logger().info(f"Accel bias: [{accel_bias[0]:.4f}, {accel_bias[1]:.4f}, {accel_bias[2]:.4f}] m/s^2")
+        self.get_logger().info(f"Gyro bias:  [{gyro_mean[0]:.6f}, {gyro_mean[1]:.6f}, {gyro_mean[2]:.6f}] rad/s")
+
+        # Clear init samples
+        self.init_samples = []
+        self.initialized = True
+        self.get_logger().info("=== EKF INITIALIZED - Starting state estimation ===")
 
     def predict(self, dt, a_m, w_m):
         # Unpack State
@@ -216,6 +325,10 @@ class EKFNode(Node):
         """
         Handle visual landmark observations with time synchronization check.
         """
+        # Skip if not initialized
+        if not self.initialized:
+            return
+
         # Time synchronization check
         if self.last_imu_time is None:
             # No IMU data yet, skip vision update

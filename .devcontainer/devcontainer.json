@@ -17,9 +17,10 @@
     // Set the DISPLAY environment variable
     "containerEnv": {
         "DISPLAY": "${localEnv:DISPLAY}",
-        "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+        // "__GLX_VENDOR_LIBRARY_NAME": "nvidia", // for wayland users with NVIDIA GPUs
         "NVIDIA_VISIBLE_DEVICES": "all",
-        "NVIDIA_DRIVER_CAPABILITIES": "graphics,utility,compute,display"
+        "NVIDIA_DRIVER_CAPABILITIES": "graphics,utility,compute,display",
+        "QT_X11_NO_MITSHM": "1"
     },
 
     // Keep the container running even if VS Code closes
