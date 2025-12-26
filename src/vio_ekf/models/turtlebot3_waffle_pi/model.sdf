@@ -317,14 +317,22 @@
         <surface>
           <contact>
             <ode>
-              <soft_cfm>0</soft_cfm>
+              <soft_cfm>0.001</soft_cfm>
               <soft_erp>0.2</soft_erp>
-              <kp>1e+5</kp>
-              <kd>1</kd>
-              <max_vel>0.01</max_vel>
-              <min_depth>0.001</min_depth>
+              <kp>1e+4</kp>
+              <kd>100</kd>
+              <max_vel>0.001</max_vel>
+              <min_depth>0.0005</min_depth>
             </ode>
           </contact>
+          <friction>
+            <ode>
+              <mu>0.0</mu>
+              <mu2>0.0</mu2>
+              <slip1>1.0</slip1>
+              <slip2>1.0</slip2>
+            </ode>
+          </friction>
         </surface>
       </collision>
     </link>
@@ -351,14 +359,22 @@
         <surface>
           <contact>
             <ode>
-              <soft_cfm>0</soft_cfm>
+              <soft_cfm>0.001</soft_cfm>
               <soft_erp>0.2</soft_erp>
-              <kp>1e+5</kp>
-              <kd>1</kd>
-              <max_vel>0.01</max_vel>
-              <min_depth>0.001</min_depth>
+              <kp>1e+4</kp>
+              <kd>100</kd>
+              <max_vel>0.001</max_vel>
+              <min_depth>0.0005</min_depth>
             </ode>
           </contact>
+          <friction>
+            <ode>
+              <mu>0.0</mu>
+              <mu2>0.0</mu2>
+              <slip1>1.0</slip1>
+              <slip2>1.0</slip2>
+            </ode>
+          </friction>
         </surface>
       </collision>
     </link>

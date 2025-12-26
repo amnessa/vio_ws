@@ -29,8 +29,9 @@ class EKFNode(Node):
 
         # Covariance Matrix (15x15)
         self.P = np.eye(15) * 0.1
-        self.P[0:3, 0:3] *= 0.01  # Small initial position uncertainty
-        self.P[6:9, 6:9] *= 0.01 # Initial orientation uncertainty
+        self.P[0:3, 0:3] *= 0.1  # initial position uncertainty
+        self.P[3:6, 3:6] *= 0.1  # initial velocity uncertainty
+        self.P[6:9, 6:9] *= 0.1 # Initial orientation uncertainty
         self.P[9:12, 9:12] *= 0.01 # Accel bias uncertainty
         self.P[12:15, 12:15] *= 0.001 # Gyro bias uncertainty
 
@@ -41,9 +42,14 @@ class EKFNode(Node):
         self.sigma_g = 0.03     # Gyro noise stddev (rad/s) - matches observed Y-axis std
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 0  # Accel bias random walk
-        self.Q_bg = 0  # Gyro bias random walk (increased to allow faster adaptation)
-        self.R_cam = 20.0  # Pixel measurement noise (variance)
+        self.Q_ba = 1e-5  # Accel bias random walk - enables learning
+        self.Q_bg = 1e-5  # Gyro bias random walk - enables learning
+        self.R_cam = 15.0   # Pixel measurement noise - trust vision more
+
+        # Outlier rejection settings
+        self.mahalanobis_threshold = 5.0  # Chi-squared 95% for 2 DOF is 5.99
+        self.consecutive_outliers = 0
+        self.max_consecutive_outliers = 20  # If too many outliers, reset covariance
 
         # Gravity correction gain (for attitude correction from accelerometer)
         self.gravity_correction_gain = 0.05  # Increased gain for faster correction
@@ -264,6 +270,18 @@ class EKFNode(Node):
         # This should be near [0, 0, 0] when stationary if quaternion is correct.
         # If any component is large (~10-20), the quaternion order is wrong.
         acc_world = R_wb @ a_unbiased - self.g
+
+        # --- watchdog: detect explosion ---
+        # if the robot thinks its is accelerating > 5m/s^2 it is likely broken
+        # this resets the velocity/tilt to stop the explosion
+        if np.linalg.norm(acc_world) > 5.0:
+            self.get_logger().error(f"Filter Divergence! Accel: {np.linalg.norm(acc_world):.1f} m/s^2. Resetting...")
+            self.x[3:6] = 0.0  # Reset Velocity
+            self.x[7:10] = 0.0 # Reset Tilt (x, y, z components of quat)
+            self.x[6] = 1.0    # Reset w component
+            self.P = np.eye(15) * 1.0 # Reset Covariance
+            return # Skip integration this step
+
         if not hasattr(self, '_debug_counter'):
             self._debug_counter = 0
         self._debug_counter += 1
@@ -497,8 +515,39 @@ class EKFNode(Node):
         # S = H P H.T + R
         S = H @ self.P @ H.T + np.eye(2) * self.R_cam
 
+        # --- Mahalanobis Distance Gating ---
+        # Use statistical gating instead of fixed pixel threshold
+        # d^2 = z_res^T @ S^{-1} @ z_res should follow chi-squared with 2 DOF
         try:
-            K = self.P @ H.T @ np.linalg.inv(S)
+            S_inv = np.linalg.inv(S)
+            mahalanobis_sq = z_res @ S_inv @ z_res
+        except np.linalg.LinAlgError:
+            self.get_logger().warn("Singular S matrix, skipping update")
+            return
+
+        pixel_residual = np.linalg.norm(z_res)
+
+        if mahalanobis_sq > self.mahalanobis_threshold**2:
+            self.consecutive_outliers += 1
+
+            # If too many consecutive outliers, the filter has diverged
+            # Reset position covariance to allow larger corrections
+            if self.consecutive_outliers >= self.max_consecutive_outliers:
+                self.get_logger().warn(f"FILTER RECOVERY: {self.consecutive_outliers} consecutive outliers. Resetting P!")
+                self.P[0:3, 0:3] = np.eye(3) * 1.0   # Large position uncertainty
+                self.P[3:6, 3:6] = np.eye(3) * 0.5  # Large velocity uncertainty
+                self.consecutive_outliers = 0
+                # Don't fuse this one, but next update will go through
+                return
+
+            self.get_logger().warn(f"Outlier Rejected! Residual: {pixel_residual:.1f} px, Mahal: {np.sqrt(mahalanobis_sq):.1f}")
+            return
+
+        # Good measurement - reset outlier counter
+        self.consecutive_outliers = 0
+
+        try:
+            K = self.P @ H.T @ S_inv
         except np.linalg.LinAlgError:
             return
 

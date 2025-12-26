@@ -29,6 +29,7 @@ install(TARGETS
 install (PROGRAMS
   src/vision_node.py
   src/ekf_node.py
+  src/eval_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
