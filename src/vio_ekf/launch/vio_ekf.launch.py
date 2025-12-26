@@ -101,7 +101,7 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         arguments=['0', '0', '0', '0', '0', '0',
-                   'turtlebot3/camera_link', 'turtlebot3/camera_link/camera'],
+                   'camera_link', 'camera_link/camera'],
         parameters=[{'use_sim_time': True}],
         output='screen'
     )

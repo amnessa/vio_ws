@@ -17,7 +17,7 @@ class EKFNode(Node):
         # Collect IMU samples while stationary to estimate biases and initial orientation
         self.initialized = False
         self.init_samples = []
-        self.init_sample_count = 800  # Number of samples to collect (at 200Hz = 4 seconds)
+        self.init_sample_count = 1600  # Number of samples to collect (at 200Hz = 4 seconds)
         self.gravity_magnitude = 9.81  # Expected gravity magnitude (will be updated from IMU)
         self.g = np.array([0.0, 0.0, 9.81])  # Gravity vector in world frame (will be updated)
 
@@ -41,9 +41,9 @@ class EKFNode(Node):
         self.sigma_g = 0.03     # Gyro noise stddev (rad/s) - matches observed Y-axis std
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 1e-4  # Accel bias random walk
-        self.Q_bg = 1e-4  # Gyro bias random walk (increased to allow faster adaptation)
-        self.R_cam = 5.0  # Pixel measurement noise (variance)
+        self.Q_ba = 0  # Accel bias random walk
+        self.Q_bg = 0  # Gyro bias random walk (increased to allow faster adaptation)
+        self.R_cam = 20.0  # Pixel measurement noise (variance)
 
         # Gravity correction gain (for attitude correction from accelerometer)
         self.gravity_correction_gain = 0.05  # Increased gain for faster correction
@@ -69,7 +69,7 @@ class EKFNode(Node):
         # But OpenCV projection assumes Z is depth.
         # Transform Optical (Z-forward) to Standard (X-forward):
         # R_opt_std = [0 0 1; -1 0 0; 0 -1 0]
-        self.R_b_c = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
+        self.R_b_c = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]])
 
         # Camera Intrinsics (will be updated callback)
         self.K = np.array([[530.0, 0, 320.0], [0, 530.0, 240.0], [0, 0, 1]])
@@ -333,35 +333,35 @@ class EKFNode(Node):
 
         self.P = Fx @ self.P @ Fx.T + Qi
 
-        # --- GRAVITY-BASED ATTITUDE CORRECTION ---
-        # Use accelerometer to provide roll/pitch reference (complementary filter style)
-        # This prevents gyro noise from accumulating into orientation drift
-        # Only apply when acceleration magnitude is close to gravity (not accelerating)
-        accel_magnitude = np.linalg.norm(a_unbiased)
-        if abs(accel_magnitude - self.gravity_magnitude) < 0.5:  # Within 0.5 m/s^2 of gravity
-            # Current gravity estimate in world frame
-            gravity_world_est = R_wb @ a_unbiased
+        # # --- GRAVITY-BASED ATTITUDE CORRECTION ---
+        # # Use accelerometer to provide roll/pitch reference (complementary filter style)
+        # # This prevents gyro noise from accumulating into orientation drift
+        # # Only apply when acceleration magnitude is close to gravity (not accelerating)
+        # accel_magnitude = np.linalg.norm(a_unbiased)
+        # if abs(accel_magnitude - self.gravity_magnitude) < 0.5:  # Within 0.5 m/s^2 of gravity
+        #     # Current gravity estimate in world frame
+        #     gravity_world_est = R_wb @ a_unbiased
 
-            # Expected gravity direction (up)
-            gravity_world_expected = self.g
+        #     # Expected gravity direction (up)
+        #     gravity_world_expected = self.g
 
-            # Compute attitude error as cross product (small angle approximation)
-            # This gives us the rotation needed to align estimated gravity with expected
-            gravity_error = np.cross(gravity_world_est / accel_magnitude,
-                                     gravity_world_expected / self.gravity_magnitude)
+        #     # Compute attitude error as cross product (small angle approximation)
+        #     # This gives us the rotation needed to align estimated gravity with expected
+        #     gravity_error = np.cross(gravity_world_est / accel_magnitude,
+        #                              gravity_world_expected / self.gravity_magnitude)
 
-            # Apply small correction to orientation (complementary filter)
-            # Only correct roll and pitch (indices 0, 1), not yaw (index 2)
-            correction = self.gravity_correction_gain * gravity_error
-            correction[2] = 0  # Don't correct yaw from gravity
+        #     # Apply small correction to orientation (complementary filter)
+        #     # Only correct roll and pitch (indices 0, 1), not yaw (index 2)
+        #     correction = self.gravity_correction_gain * gravity_error
+        #     correction[2] = 0  # Don't correct yaw from gravity
 
-            # Apply correction via quaternion
-            if np.linalg.norm(correction) > 1e-8:
-                dq_correction = R.from_rotvec(correction)
-                q_curr = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])
-                q_corrected = q_curr * dq_correction
-                q_new_corr = q_corrected.as_quat()
-                self.x[6:10] = np.array([q_new_corr[3], q_new_corr[0], q_new_corr[1], q_new_corr[2]])
+        #     # Apply correction via quaternion
+        #     if np.linalg.norm(correction) > 1e-8:
+        #         dq_correction = R.from_rotvec(correction)
+        #         q_curr = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])
+        #         q_corrected = q_curr * dq_correction
+        #         q_new_corr = q_corrected.as_quat()
+        #         self.x[6:10] = np.array([q_new_corr[3], q_new_corr[0], q_new_corr[1], q_new_corr[2]])
 
     def gt_callback(self, msg):
         """
@@ -424,6 +424,7 @@ class EKFNode(Node):
 
     def update(self, lm_pos_world, u_meas, v_meas):
         # --- UPDATE STEP ---
+        self.get_logger().info(f"Vision update! Landmark at {lm_pos_world}")
         # 1. Project Map Point to Camera
         p_w = self.x[0:3]
         q_w = self.x[6:10] # [w,x,y,z]
