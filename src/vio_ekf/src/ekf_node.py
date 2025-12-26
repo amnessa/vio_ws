@@ -42,9 +42,9 @@ class EKFNode(Node):
         self.sigma_g = 0.03     # Gyro noise stddev (rad/s) - matches observed Y-axis std
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 1e-5  # Accel bias random walk - enables learning
-        self.Q_bg = 1e-5  # Gyro bias random walk - enables learning
-        self.R_cam = 15.0   # Pixel measurement noise - trust vision more
+        self.Q_ba = 1e-7  # Accel bias random walk - enables learning
+        self.Q_bg = 1e-7  # Gyro bias random walk - enables learning
+        self.R_cam = 10.0   # Pixel measurement noise - trust vision more
 
         # Outlier rejection settings
         self.mahalanobis_threshold = 5.0  # Chi-squared 95% for 2 DOF is 5.99
@@ -279,6 +279,8 @@ class EKFNode(Node):
             self.x[3:6] = 0.0  # Reset Velocity
             self.x[7:10] = 0.0 # Reset Tilt (x, y, z components of quat)
             self.x[6] = 1.0    # Reset w component
+
+            self.x[10:16] = 0.0 # Reset Biases
             self.P = np.eye(15) * 1.0 # Reset Covariance
             return # Skip integration this step
 
