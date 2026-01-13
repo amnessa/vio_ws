@@ -83,8 +83,8 @@ class EKFNode(Node):
         # Gravity correction gain (for attitude correction from accelerometer)
         # Higher values = faster convergence but more noise sensitivity
         # Typical complementary filter uses 0.02-0.1 for α
-        # For ground robots, we can be more aggressive since they don't have rapid attitude changes
-        self.gravity_correction_gain = 0.1  # Aggressive correction for ground robot
+        # Lower value reduces jitter from IMU noise (recommendation from analysis)
+        self.gravity_correction_gain = 0.02  # Conservative to reduce jitter
 
         # Time sync tolerance (max acceptable delay between IMU and vision)
         self.max_time_delay = 0.1  # 100ms tolerance (relaxed for Gazebo)
@@ -393,12 +393,13 @@ class EKFNode(Node):
         # 1. Z-acceleration should be ~0 (can't fly or sink)
         # 2. Z-velocity should be ~0
         # 3. Z-position should be ~0 (ground level)
-        #
-        # Small orientation errors cause gravity leakage into X/Y which
-        # causes position to fly away. We apply damping to prevent this.
 
-        # Limit maximum believable acceleration (robot can't accelerate faster than ~2-3 m/s²)
-        MAX_ACCEL = 3.0  # m/s² - physical limit for ground robot
+        # NOTE: Removed aggressive acceleration clipping per recommendations.md
+        # Hard clipping causes divergence when robot experiences shocks/maneuvers
+        # Let the EKF handle uncertainty naturally; only clip truly extreme values
+
+        # Soft limit for extreme cases only (e.g., sensor glitches)
+        MAX_ACCEL = 10.0  # m/s² - allow larger transients, only clip glitches
         acc_world_clipped = np.clip(acc_world, -MAX_ACCEL, MAX_ACCEL)
 
         # Zero out Z-axis acceleration for ground robot (can't accelerate vertically)
@@ -407,7 +408,7 @@ class EKFNode(Node):
         acc_world_norm = np.linalg.norm(acc_world)
 
         # --- Divergence Watchdog ---
-        if acc_world_norm > 15.0:
+        if acc_world_norm > 20.0:  # Increased threshold - let filter work
             self.get_logger().error(f"Filter Divergence! Accel: {acc_world_norm:.1f} m/s^2. Re-initializing from IMU...")
             self._reinitialize_orientation(a_m, w_m)
             return
@@ -417,7 +418,7 @@ class EKFNode(Node):
             self._debug_counter = 0
         self._debug_counter += 1
         if self._debug_counter % 400 == 1:
-            self.get_logger().info(f"World Accel: [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2 (clipped norm={np.linalg.norm(acc_world_clipped):.2f})")
+            self.get_logger().info(f"World Accel: [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2")
 
         # --- Position Update ---
         # p_k = p_{k-1} + v_{k-1}*dt + 0.5*(R*a_corrected - g)*dt^2
@@ -480,11 +481,8 @@ class EKFNode(Node):
         ba_new = np.clip(ba_new, -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
         bg_new = np.clip(bg_new, -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
 
-        # --- Velocity Decay (Prevents unbounded drift) ---
-        # When no acceleration is commanded, velocity should naturally decay
-        # This models friction/drag and prevents IMU noise from accumulating
-        VELOCITY_DECAY = 0.999  # Per step decay (at 200Hz, ~0.18 decay per second)
-        v_new = v_new * VELOCITY_DECAY
+        # NOTE: VELOCITY_DECAY removed per recommendations.md
+        # Non-physical damping fights against visual updates. Let EKF handle drift naturally.
 
         # Update Nominal State
         self.x[0:3] = p_new
@@ -835,19 +833,21 @@ class EKFNode(Node):
         if mahal_dist > adaptive_threshold:
             self.consecutive_outliers += 1
 
-            # If too many consecutive outliers, the filter has likely diverged
-            # Expand covariance to allow correction on next measurement
-            if self.consecutive_outliers >= self.max_consecutive_outliers:
-                self.get_logger().warn(f"FILTER RECOVERY: {self.consecutive_outliers} outliers. Expanding covariance!")
-                self.P[0:3, 0:3] = np.eye(3) * 10.0   # Very large position uncertainty
-                self.P[3:6, 3:6] = np.eye(3) * 1.0   # Large velocity uncertainty
-                self.P[6:9, 6:9] = np.eye(3) * 0.5   # Moderate orientation uncertainty
-                self.consecutive_outliers = 0
-                # Don't fuse this one, but next update will go through
-                return
+            # NOTE: Removed manual covariance expansion per recommendations.md
+            # Manual P expansion causes violent state jumps (high Kalman gain)
+            # Instead, let the filter naturally increase uncertainty through Q
+            # and use a higher threshold to accept more measurements
 
-            self.get_logger().warn(f"Outlier Rejected! Residual: {pixel_residual:.1f} px, Mahal: {mahal_dist:.1f} (thresh={adaptive_threshold:.1f})")
-            return
+            if self.consecutive_outliers >= self.max_consecutive_outliers:
+                # After many outliers, lower threshold to accept next measurement
+                # This allows gradual correction rather than violent jumps
+                self.get_logger().warn(f"FILTER RECOVERY: {self.consecutive_outliers} outliers. Lowering threshold temporarily.")
+                # Don't modify P - just accept the next measurement with a warning
+                self.consecutive_outliers = 0
+                # Fall through to accept this measurement (don't return)
+            else:
+                self.get_logger().warn(f"Outlier Rejected! Residual: {pixel_residual:.1f} px, Mahal: {mahal_dist:.1f} (thresh={adaptive_threshold:.1f})")
+                return
 
         # Good measurement - reset outlier counter
         self.consecutive_outliers = 0
@@ -869,51 +869,57 @@ class EKFNode(Node):
         self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ (np.eye(2) * self.R_cam) @ K.T
 
         # 4. Inject Error into Nominal State
-        # --- LIMIT CORRECTIONS TO PREVENT INSTABILITY ---
-        # Vision is a position measurement - velocity corrections should be small
-        # Large velocity corrections indicate P has grown too correlated
+        # NOTE: Removed hard-clipping per recommendations.md
+        # Hard clipping prevents proper convergence and causes persistent innovations.
+        # The Kalman filter is designed to handle large residuals through its math.
+        # We only apply soft limits for safety (log but don't clip unless extreme)
 
-        # Position correction (allow larger corrections for known landmarks)
-        MAX_POS_CORRECTION = 0.5  # meters per update
-        pos_correction = np.clip(dx[0:3], -MAX_POS_CORRECTION, MAX_POS_CORRECTION)
+        # Position correction (no hard clip - let EKF work)
+        pos_correction = dx[0:3]
+        if np.linalg.norm(pos_correction) > 1.0:
+            self.get_logger().info(f"Large position correction: {np.linalg.norm(pos_correction):.2f}m", throttle_duration_sec=1.0)
         self.x[0:3] += pos_correction
 
-        # Velocity correction (should be small from vision - it's not a velocity measurement!)
-        # Vision can only correct velocity through P correlations, which often causes issues
-        MAX_VEL_CORRECTION = 0.3  # m/s per update (much more conservative)
-        vel_correction = np.clip(dx[3:6], -MAX_VEL_CORRECTION, MAX_VEL_CORRECTION)
+        # Velocity correction (soft limit only for extreme cases)
+        vel_correction = dx[3:6]
+        vel_corr_norm = np.linalg.norm(vel_correction)
+        if vel_corr_norm > 2.0:  # Only clip truly extreme corrections
+            self.get_logger().warn(f"Extreme velocity correction clipped: {vel_corr_norm:.2f} m/s", throttle_duration_sec=1.0)
+            vel_correction = vel_correction * (2.0 / vel_corr_norm)
         self.x[3:6] += vel_correction
 
-        # Log if corrections were limited (indicates potential issues)
-        if np.any(np.abs(dx[3:6]) > MAX_VEL_CORRECTION):
-            self.get_logger().warn(
-                f"Vision velocity correction clipped: [{dx[3]:.2f}, {dx[4]:.2f}, {dx[5]:.2f}] -> [{vel_correction[0]:.2f}, {vel_correction[1]:.2f}, {vel_correction[2]:.2f}]",
-                throttle_duration_sec=1.0
-            )
-
-        # Orientation (Quaternion multiply) - limit rotation correction too
-        MAX_ROT_CORRECTION = 0.1  # radians per update (~6 degrees)
-        rot_correction = np.clip(dx[6:9], -MAX_ROT_CORRECTION, MAX_ROT_CORRECTION)
+        # Orientation (Quaternion multiply) - soft limit for extreme cases only
+        rot_correction = dx[6:9]
+        rot_corr_norm = np.linalg.norm(rot_correction)
+        if rot_corr_norm > 0.5:  # ~30 degrees - truly extreme
+            self.get_logger().warn(f"Extreme rotation correction clipped: {np.degrees(rot_corr_norm):.1f} deg", throttle_duration_sec=1.0)
+            rot_correction = rot_correction * (0.5 / rot_corr_norm)
         dq_rot = R.from_rotvec(rot_correction)
         q_curr_obj = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]]) # [x,y,z,w]
         q_new_obj = q_curr_obj * dq_rot
         q_new = q_new_obj.as_quat()
         self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
 
-        # Biases - limit corrections (biases should change slowly)
-        MAX_BIAS_CORRECTION = 0.01  # per update
-        self.x[10:13] += np.clip(dx[9:12], -MAX_BIAS_CORRECTION, MAX_BIAS_CORRECTION)
-        self.x[13:16] += np.clip(dx[12:15], -MAX_BIAS_CORRECTION, MAX_BIAS_CORRECTION)
+        # Biases - apply corrections (EKF handles the rate naturally through P)
+        self.x[10:13] += dx[9:12]
+        self.x[13:16] += dx[12:15]
+
+        # Enforce bias magnitude limits (physical bounds, not rate limits)
+        MAX_ACCEL_BIAS = 0.5  # m/s² - realistic MEMS limit
+        MAX_GYRO_BIAS = 0.1   # rad/s - realistic MEMS limit
+        self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
+        self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
 
         # --- GROUND ROBOT CONSTRAINTS (post-update) ---
         self.x[2] = 0.0  # Z position = 0
         self.x[5] = 0.0  # Z velocity = 0
 
-        # Final velocity sanity check
-        MAX_SPEED = 1.5
+        # Final velocity sanity check (physical limit, not EKF limit)
+        MAX_SPEED = 2.0  # m/s - slightly above TurtleBot max for safety margin
         speed = np.linalg.norm(self.x[3:5])
         if speed > MAX_SPEED:
             self.x[3:5] = self.x[3:5] * (MAX_SPEED / speed)
+            self.get_logger().warn(f"Velocity exceeded {MAX_SPEED} m/s, clipped", throttle_duration_sec=2.0)
 
         # Reset Error State (Implied dx=0 for next step)
 
