@@ -291,6 +291,7 @@ class EKFNode(Node):
         we estimate orientation from the current accelerometer reading.
         Position is NOT reset - we keep the current estimate.
         Velocity is reset to zero (safest assumption).
+        BIASES ARE RESET to prevent runaway bias from causing immediate re-divergence.
 
         This allows the filter to recover from bad orientation estimates
         without losing all position information.
@@ -331,14 +332,20 @@ class EKFNode(Node):
         # Ground constraint: Z position should be 0
         self.x[2] = 0.0
 
-        # Update gyro bias from current reading (assume stationary-ish)
-        # Don't fully reset, just nudge towards current reading
-        self.x[13:16] = 0.8 * self.x[13:16] + 0.2 * w_m
+        # CRITICAL: Reset accelerometer bias to zero!
+        # If bias has grown to a huge value (common during divergence), keeping it
+        # will cause immediate re-divergence. Realistic accel bias is < 0.5 m/s².
+        self.x[10:13] = 0.0
 
-        # Expand covariance to reflect uncertainty
+        # Reset gyro bias to zero as well (will re-estimate during operation)
+        self.x[13:16] = 0.0
+
+        # Expand covariance to reflect uncertainty after reset
         self.P[0:3, 0:3] = np.eye(3) * 1.0    # Position uncertainty
         self.P[3:6, 3:6] = np.eye(3) * 0.5    # Velocity uncertainty
         self.P[6:9, 6:9] = np.eye(3) * 0.3    # Orientation uncertainty
+        self.P[9:12, 9:12] = np.eye(3) * 0.1  # Accel bias uncertainty (allow re-estimation)
+        self.P[12:15, 12:15] = np.eye(3) * 0.1  # Gyro bias uncertainty
 
         self.get_logger().info(f"Re-initialized quat: w={self.x[6]:.3f}, x={self.x[7]:.3f}, y={self.x[8]:.3f}, z={self.x[9]:.3f}")
 
@@ -463,6 +470,16 @@ class EKFNode(Node):
         ba_new = ba.copy()
         bg_new = bg.copy()
 
+        # --- BIAS MAGNITUDE LIMITS ---
+        # Prevent biases from growing to unrealistic values
+        # Realistic accelerometer bias: < 0.5 m/s² (typical MEMS IMU)
+        # Realistic gyroscope bias: < 0.1 rad/s (~5 deg/s)
+        MAX_ACCEL_BIAS = 0.5  # m/s²
+        MAX_GYRO_BIAS = 0.1   # rad/s
+
+        ba_new = np.clip(ba_new, -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
+        bg_new = np.clip(bg_new, -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
+
         # --- Velocity Decay (Prevents unbounded drift) ---
         # When no acceleration is commanded, velocity should naturally decay
         # This models friction/drag and prevents IMU noise from accumulating
@@ -576,6 +593,32 @@ class EKFNode(Node):
 
         # Ensure symmetry (numerical stability)
         self.P = 0.5 * (self.P + self.P.T)
+
+        # --- COVARIANCE BOUNDS ---
+        # Prevent covariance from growing unbounded, which causes erratic Kalman gains
+        # These limits represent our worst-case uncertainty
+        MAX_POS_VAR = 10.0   # 10m² = ~3m std (if off by more, filter should reset)
+        MAX_VEL_VAR = 1.0    # 1m²/s² = 1m/s std (robot max speed is 0.26 m/s)
+        MAX_ROT_VAR = 0.5    # 0.5 rad² = ~40° std
+        MAX_BIAS_VAR = 0.1   # Bias variance
+
+        # Clip diagonal elements
+        for i in range(3):
+            self.P[i, i] = min(self.P[i, i], MAX_POS_VAR)          # Position
+            self.P[3+i, 3+i] = min(self.P[3+i, 3+i], MAX_VEL_VAR)  # Velocity
+            self.P[6+i, 6+i] = min(self.P[6+i, 6+i], MAX_ROT_VAR)  # Orientation
+            self.P[9+i, 9+i] = min(self.P[9+i, 9+i], MAX_BIAS_VAR) # Accel bias
+            self.P[12+i, 12+i] = min(self.P[12+i, 12+i], MAX_BIAS_VAR) # Gyro bias
+
+        # Limit off-diagonal correlations to prevent wild cross-corrections
+        # Correlation coefficient should stay in [-1, 1]
+        for i in range(15):
+            for j in range(i+1, 15):
+                max_corr = np.sqrt(self.P[i,i] * self.P[j,j])
+                if abs(self.P[i,j]) > max_corr:
+                    sign = np.sign(self.P[i,j])
+                    self.P[i,j] = sign * max_corr * 0.99  # Keep correlation < 1
+                    self.P[j,i] = self.P[i,j]
 
         # ===================================================================
         # STEP 5: ACCELEROMETER-BASED ATTITUDE CORRECTION
@@ -821,24 +864,56 @@ class EKFNode(Node):
         # Error State Update
         dx = K @ z_res
 
-        # Update Covariance
+        # Update Covariance (Joseph form for numerical stability)
         I = np.eye(15)
-        self.P = (I - K @ H) @ self.P
+        self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ (np.eye(2) * self.R_cam) @ K.T
 
         # 4. Inject Error into Nominal State
-        # Position
-        self.x[0:3] += dx[0:3]
-        # Velocity
-        self.x[3:6] += dx[3:6]
-        # Orientation (Quaternion multiply)
-        dq_rot = R.from_rotvec(dx[6:9])
+        # --- LIMIT CORRECTIONS TO PREVENT INSTABILITY ---
+        # Vision is a position measurement - velocity corrections should be small
+        # Large velocity corrections indicate P has grown too correlated
+
+        # Position correction (allow larger corrections for known landmarks)
+        MAX_POS_CORRECTION = 0.5  # meters per update
+        pos_correction = np.clip(dx[0:3], -MAX_POS_CORRECTION, MAX_POS_CORRECTION)
+        self.x[0:3] += pos_correction
+
+        # Velocity correction (should be small from vision - it's not a velocity measurement!)
+        # Vision can only correct velocity through P correlations, which often causes issues
+        MAX_VEL_CORRECTION = 0.3  # m/s per update (much more conservative)
+        vel_correction = np.clip(dx[3:6], -MAX_VEL_CORRECTION, MAX_VEL_CORRECTION)
+        self.x[3:6] += vel_correction
+
+        # Log if corrections were limited (indicates potential issues)
+        if np.any(np.abs(dx[3:6]) > MAX_VEL_CORRECTION):
+            self.get_logger().warn(
+                f"Vision velocity correction clipped: [{dx[3]:.2f}, {dx[4]:.2f}, {dx[5]:.2f}] -> [{vel_correction[0]:.2f}, {vel_correction[1]:.2f}, {vel_correction[2]:.2f}]",
+                throttle_duration_sec=1.0
+            )
+
+        # Orientation (Quaternion multiply) - limit rotation correction too
+        MAX_ROT_CORRECTION = 0.1  # radians per update (~6 degrees)
+        rot_correction = np.clip(dx[6:9], -MAX_ROT_CORRECTION, MAX_ROT_CORRECTION)
+        dq_rot = R.from_rotvec(rot_correction)
         q_curr_obj = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]]) # [x,y,z,w]
         q_new_obj = q_curr_obj * dq_rot
         q_new = q_new_obj.as_quat()
         self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
-        # Biases
-        self.x[10:13] += dx[9:12]
-        self.x[13:16] += dx[12:15]
+
+        # Biases - limit corrections (biases should change slowly)
+        MAX_BIAS_CORRECTION = 0.01  # per update
+        self.x[10:13] += np.clip(dx[9:12], -MAX_BIAS_CORRECTION, MAX_BIAS_CORRECTION)
+        self.x[13:16] += np.clip(dx[12:15], -MAX_BIAS_CORRECTION, MAX_BIAS_CORRECTION)
+
+        # --- GROUND ROBOT CONSTRAINTS (post-update) ---
+        self.x[2] = 0.0  # Z position = 0
+        self.x[5] = 0.0  # Z velocity = 0
+
+        # Final velocity sanity check
+        MAX_SPEED = 1.5
+        speed = np.linalg.norm(self.x[3:5])
+        if speed > MAX_SPEED:
+            self.x[3:5] = self.x[3:5] * (MAX_SPEED / speed)
 
         # Reset Error State (Implied dx=0 for next step)
 
