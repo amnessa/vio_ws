@@ -46,7 +46,7 @@ class EKFNode(Node):
         # Collect IMU samples while stationary to estimate biases and initial orientation
         self.initialized = False
         self.init_samples = []
-        self.init_sample_count = 1600  # Number of samples to collect (at 200Hz = 4 seconds)
+        self.init_sample_count = 2400  # Number of samples to collect (at 200Hz = 12 seconds)
         self.gravity_magnitude = 9.81  # Expected gravity magnitude (will be updated from IMU)
         self.g = np.array([0.0, 0.0, 9.81])  # Gravity vector in world frame (will be updated)
 
@@ -57,34 +57,37 @@ class EKFNode(Node):
         self.x[6] = 1.0  # Initial quaternion (w=1, x=0, y=0, z=0)
 
         # Covariance Matrix (15x15)
+        # Start with higher uncertainty - let vision corrections do their job
         self.P = np.eye(15) * 0.1
-        self.P[0:3, 0:3] *= 0.1  # initial position uncertainty
-        self.P[3:6, 3:6] *= 0.1  # initial velocity uncertainty
-        self.P[6:9, 6:9] *= 0.1 # Initial orientation uncertainty
-        self.P[9:12, 9:12] *= 0.01 # Accel bias uncertainty
-        self.P[12:15, 12:15] *= 0.001 # Gyro bias uncertainty
+        self.P[0:3, 0:3] = np.eye(3) * 0.5   # Position uncertainty (0.5m std)
+        self.P[3:6, 3:6] = np.eye(3) * 0.1   # Velocity uncertainty (0.3m/s std)
+        self.P[6:9, 6:9] = np.eye(3) * 0.1   # Orientation uncertainty (~18 deg std)
+        self.P[9:12, 9:12] = np.eye(3) * 0.01  # Accel bias uncertainty
+        self.P[12:15, 12:15] = np.eye(3) * 0.01  # Gyro bias uncertainty
 
-        # Noise Parameters - Updated based on observed IMU statistics
-        # From initialization: accel_std ~0.07 m/s^2, gyro_std ~0.026 rad/s (Y axis has 100x more!)
-        # These are higher than datasheet due to Gazebo simulation noise
-        self.sigma_a = 0.2      # Accel noise stddev (m/s^2) - conservative
-        self.sigma_g = 0.03     # Gyro noise stddev (rad/s) - matches observed Y-axis std
+        # Noise Parameters - Tuned for Gazebo simulation
+        # Higher values = trust IMU less, allow more vision correction
+        self.sigma_a = 0.5      # Accel noise stddev (m/s^2) - higher for Gazebo
+        self.sigma_g = 0.05     # Gyro noise stddev (rad/s) - accounts for simulation noise
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 1e-7  # Accel bias random walk - enables learning
-        self.Q_bg = 1e-7  # Gyro bias random walk - enables learning
-        self.R_cam = 10.0   # Pixel measurement noise - trust vision more
+        self.Q_ba = 1e-5  # Accel bias random walk - faster adaptation
+        self.Q_bg = 1e-5  # Gyro bias random walk - faster adaptation
+        self.R_cam = 5.0   # Pixel measurement noise - trust vision more (lower = more trust)
 
         # Outlier rejection settings
-        self.mahalanobis_threshold = 5.0  # Chi-squared 95% for 2 DOF is 5.99
+        self.mahalanobis_threshold = 8.0  # Relaxed threshold (chi-squared 99.5% for 2 DOF)
         self.consecutive_outliers = 0
-        self.max_consecutive_outliers = 20  # If too many outliers, reset covariance
+        self.max_consecutive_outliers = 10  # Faster recovery
 
         # Gravity correction gain (for attitude correction from accelerometer)
-        self.gravity_correction_gain = 0.05  # Increased gain for faster correction
+        # Higher values = faster convergence but more noise sensitivity
+        # Typical complementary filter uses 0.02-0.1 for α
+        # For ground robots, we can be more aggressive since they don't have rapid attitude changes
+        self.gravity_correction_gain = 0.1  # Aggressive correction for ground robot
 
         # Time sync tolerance (max acceptable delay between IMU and vision)
-        self.max_time_delay = 0.05  # 50ms tolerance
+        self.max_time_delay = 0.1  # 100ms tolerance (relaxed for Gazebo)
 
         # Landmarks (Known Map from landmarks.sdf)
         # ID 1: Red, ID 2: Green, ID 3: Blue, ID 4: Yellow, ID 5: Cyan
@@ -280,6 +283,65 @@ class EKFNode(Node):
         self.initialized = True
         self.get_logger().info("=== EKF INITIALIZED - Starting state estimation ===")
 
+    def _reinitialize_orientation(self, a_m, w_m):
+        """
+        Smart re-initialization when filter diverges.
+
+        Instead of resetting to identity quaternion (which causes infinite reset loops),
+        we estimate orientation from the current accelerometer reading.
+        Position is NOT reset - we keep the current estimate.
+        Velocity is reset to zero (safest assumption).
+
+        This allows the filter to recover from bad orientation estimates
+        without losing all position information.
+        """
+        self.get_logger().warn("Re-initializing orientation from current IMU...")
+
+        # Estimate orientation from accelerometer (gravity direction)
+        accel_norm = np.linalg.norm(a_m)
+        if accel_norm < 0.1:
+            self.get_logger().error("Accelerometer reading too small, cannot re-initialize")
+            return
+
+        gravity_body = a_m / accel_norm
+        gravity_world = np.array([0.0, 0.0, 1.0])
+
+        # Find rotation that aligns gravity_body with gravity_world
+        v = np.cross(gravity_body, gravity_world)
+        s = np.linalg.norm(v)
+        c = np.dot(gravity_body, gravity_world)
+
+        if s < 1e-6:
+            if c > 0:
+                R_init = np.eye(3)
+            else:
+                R_init = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        else:
+            vx = skew_symmetric(v)
+            R_init = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+        # Convert to quaternion
+        rot = R.from_matrix(R_init)
+        q_scipy = rot.as_quat()  # [x, y, z, w]
+        self.x[6:10] = np.array([q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]])
+
+        # Reset velocity to zero
+        self.x[3:6] = 0.0
+
+        # Ground constraint: Z position should be 0
+        self.x[2] = 0.0
+
+        # Update gyro bias from current reading (assume stationary-ish)
+        # Don't fully reset, just nudge towards current reading
+        self.x[13:16] = 0.8 * self.x[13:16] + 0.2 * w_m
+
+        # Expand covariance to reflect uncertainty
+        self.P[0:3, 0:3] = np.eye(3) * 1.0    # Position uncertainty
+        self.P[3:6, 3:6] = np.eye(3) * 0.5    # Velocity uncertainty
+        self.P[6:9, 6:9] = np.eye(3) * 0.3    # Orientation uncertainty
+
+        self.get_logger().info(f"Re-initialized quat: w={self.x[6]:.3f}, x={self.x[7]:.3f}, y={self.x[8]:.3f}, z={self.x[9]:.3f}")
+
     def predict(self, dt, a_m, w_m):
         """
         ES-EKF / MEKF Prediction Step (IMU Odometry Model)
@@ -319,15 +381,28 @@ class EKFNode(Node):
         # Acceleration in world frame (gravity compensated)
         acc_world = R_wb @ a_corrected - self.g
 
+        # --- GROUND ROBOT CONSTRAINTS ---
+        # For a wheeled robot on flat ground:
+        # 1. Z-acceleration should be ~0 (can't fly or sink)
+        # 2. Z-velocity should be ~0
+        # 3. Z-position should be ~0 (ground level)
+        #
+        # Small orientation errors cause gravity leakage into X/Y which
+        # causes position to fly away. We apply damping to prevent this.
+
+        # Limit maximum believable acceleration (robot can't accelerate faster than ~2-3 m/s²)
+        MAX_ACCEL = 3.0  # m/s² - physical limit for ground robot
+        acc_world_clipped = np.clip(acc_world, -MAX_ACCEL, MAX_ACCEL)
+
+        # Zero out Z-axis acceleration for ground robot (can't accelerate vertically)
+        acc_world_clipped[2] = 0.0
+
+        acc_world_norm = np.linalg.norm(acc_world)
+
         # --- Divergence Watchdog ---
-        # If acceleration is unreasonably large, reset the filter
-        if np.linalg.norm(acc_world) > 5.0:
-            self.get_logger().error(f"Filter Divergence! Accel: {np.linalg.norm(acc_world):.1f} m/s^2. Resetting...")
-            self.x[3:6] = 0.0   # Reset Velocity
-            self.x[7:10] = 0.0  # Reset quaternion vector part
-            self.x[6] = 1.0     # Reset quaternion scalar
-            self.x[10:16] = 0.0 # Reset Biases
-            self.P = np.eye(15) * 1.0  # Reset Covariance
+        if acc_world_norm > 15.0:
+            self.get_logger().error(f"Filter Divergence! Accel: {acc_world_norm:.1f} m/s^2. Re-initializing from IMU...")
+            self._reinitialize_orientation(a_m, w_m)
             return
 
         # Debug logging (every ~2 seconds at 200Hz)
@@ -335,15 +410,29 @@ class EKFNode(Node):
             self._debug_counter = 0
         self._debug_counter += 1
         if self._debug_counter % 400 == 1:
-            self.get_logger().info(f"World Accel (should be ~0): [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2")
+            self.get_logger().info(f"World Accel: [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2 (clipped norm={np.linalg.norm(acc_world_clipped):.2f})")
 
         # --- Position Update ---
         # p_k = p_{k-1} + v_{k-1}*dt + 0.5*(R*a_corrected - g)*dt^2
-        p_new = p + v * dt + 0.5 * acc_world * dt**2
+        p_new = p + v * dt + 0.5 * acc_world_clipped * dt**2
+
+        # Ground constraint: Z should stay near 0
+        p_new[2] = 0.0
 
         # --- Velocity Update ---
         # v_k = v_{k-1} + (R*a_corrected - g)*dt
-        v_new = v + acc_world * dt
+        v_new = v + acc_world_clipped * dt
+
+        # Ground constraint: Z velocity should be 0
+        v_new[2] = 0.0
+
+        # Velocity damping: prevent unbounded velocity growth
+        # Max speed for TurtleBot is ~0.26 m/s (we allow up to 1.5 m/s for safety margin)
+        MAX_SPEED = 1.5  # m/s
+        speed = np.linalg.norm(v_new[:2])
+        if speed > MAX_SPEED:
+            v_new[:2] = v_new[:2] * (MAX_SPEED / speed)
+            self.get_logger().warn(f"Velocity clipped from {speed:.2f} to {MAX_SPEED} m/s")
 
         # --- Orientation Update (Quaternion Integration) ---
         # Using quaternion exponential map: q_k = q_{k-1} ⊗ exp(0.5 * ω_corrected * dt)
@@ -373,6 +462,12 @@ class EKFNode(Node):
         # Biases are constant in the prediction step (drift added via process noise)
         ba_new = ba.copy()
         bg_new = bg.copy()
+
+        # --- Velocity Decay (Prevents unbounded drift) ---
+        # When no acceleration is commanded, velocity should naturally decay
+        # This models friction/drag and prevents IMU noise from accumulating
+        VELOCITY_DECAY = 0.999  # Per step decay (at 200Hz, ~0.18 decay per second)
+        v_new = v_new * VELOCITY_DECAY
 
         # Update Nominal State
         self.x[0:3] = p_new
@@ -482,35 +577,68 @@ class EKFNode(Node):
         # Ensure symmetry (numerical stability)
         self.P = 0.5 * (self.P + self.P.T)
 
-        # # --- GRAVITY-BASED ATTITUDE CORRECTION ---
-        # # Use accelerometer to provide roll/pitch reference (complementary filter style)
-        # # This prevents gyro noise from accumulating into orientation drift
-        # # Only apply when acceleration magnitude is close to gravity (not accelerating)
-        # accel_magnitude = np.linalg.norm(a_unbiased)
-        # if abs(accel_magnitude - self.gravity_magnitude) < 0.5:  # Within 0.5 m/s^2 of gravity
-        #     # Current gravity estimate in world frame
-        #     gravity_world_est = R_wb @ a_unbiased
+        # ===================================================================
+        # STEP 5: ACCELEROMETER-BASED ATTITUDE CORRECTION
+        # ===================================================================
+        # This is the KEY insight from AHRS EKF implementations (soarbear/imu_ekf, Mayitzin/ahrs):
+        # The accelerometer provides an absolute reference for roll/pitch via gravity.
+        # Without this, small gyro biases cause orientation to drift, which causes
+        # gravity to "leak" into XY acceleration, causing position to fly away.
+        #
+        # This is essentially a complementary filter fused with the EKF:
+        # - Gyro provides high-frequency orientation changes
+        # - Accelerometer provides low-frequency absolute reference
+        #
+        # Reference: AHRS EKF correction step uses h(q) = R(q)^T @ g_world
 
-        #     # Expected gravity direction (up)
-        #     gravity_world_expected = self.g
+        # Only apply correction when accelerometer magnitude is close to gravity
+        # (i.e., when the robot is not accelerating significantly)
+        accel_magnitude = np.linalg.norm(a_corrected)
+        accel_deviation = abs(accel_magnitude - self.gravity_magnitude)
 
-        #     # Compute attitude error as cross product (small angle approximation)
-        #     # This gives us the rotation needed to align estimated gravity with expected
-        #     gravity_error = np.cross(gravity_world_est / accel_magnitude,
-        #                              gravity_world_expected / self.gravity_magnitude)
+        # Threshold: only correct when within 1.0 m/s^2 of expected gravity
+        if accel_deviation < 1.0:
+            # Normalize accelerometer reading to get measured gravity direction in body frame
+            gravity_body_measured = a_corrected / accel_magnitude
 
-        #     # Apply small correction to orientation (complementary filter)
-        #     # Only correct roll and pitch (indices 0, 1), not yaw (index 2)
-        #     correction = self.gravity_correction_gain * gravity_error
-        #     correction[2] = 0  # Don't correct yaw from gravity
+            # Expected gravity direction in body frame (using current orientation estimate)
+            # If orientation is perfect: R_wb^T @ [0,0,g] / g = [0, 0, 1] in body frame
+            # We compare measured vs expected gravity direction
+            R_bw = R_wb.T  # World to body rotation
+            gravity_body_expected = R_bw @ np.array([0.0, 0.0, 1.0])
 
-        #     # Apply correction via quaternion
-        #     if np.linalg.norm(correction) > 1e-8:
-        #         dq_correction = R.from_rotvec(correction)
-        #         q_curr = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])
-        #         q_corrected = q_curr * dq_correction
-        #         q_new_corr = q_corrected.as_quat()
-        #         self.x[6:10] = np.array([q_new_corr[3], q_new_corr[0], q_new_corr[1], q_new_corr[2]])
+            # Attitude error: cross product gives rotation axis, magnitude gives angle (small angle approx)
+            # error = measured × expected gives the rotation to correct
+            attitude_error = np.cross(gravity_body_measured, gravity_body_expected)
+
+            # This error is in body frame. For roll/pitch correction:
+            # attitude_error[0] ≈ pitch error (rotation around body X)
+            # attitude_error[1] ≈ roll error (rotation around body Y)
+            # attitude_error[2] ≈ yaw component (ignore - can't determine yaw from gravity)
+
+            # Apply correction with adaptive gain based on acceleration consistency
+            # Lower gain when accelerating (less trust in gravity direction)
+            adaptive_gain = self.gravity_correction_gain * (1.0 - accel_deviation)
+
+            # Zero out yaw correction (can't determine yaw from gravity alone)
+            attitude_error[2] = 0.0
+
+            correction = adaptive_gain * attitude_error
+
+            # Apply correction as small quaternion rotation (in body frame)
+            if np.linalg.norm(correction) > 1e-8:
+                # Create rotation from correction vector
+                dq_correction = R.from_rotvec(correction)
+
+                # Current orientation
+                q_curr = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])  # scipy [x,y,z,w]
+
+                # Apply correction: q_corrected = q_curr * dq (body frame correction)
+                q_corrected = q_curr * dq_correction
+                q_new_corr = q_corrected.as_quat()  # [x, y, z, w]
+
+                # Update state with corrected quaternion
+                self.x[6:10] = np.array([q_new_corr[3], q_new_corr[0], q_new_corr[1], q_new_corr[2]])
 
     def gt_callback(self, msg):
         """
@@ -643,9 +771,9 @@ class EKFNode(Node):
         # S = H P H.T + R
         S = H @ self.P @ H.T + np.eye(2) * self.R_cam
 
-        # --- Mahalanobis Distance Gating ---
-        # Use statistical gating instead of fixed pixel threshold
-        # d^2 = z_res^T @ S^{-1} @ z_res should follow chi-squared with 2 DOF
+        # --- Outlier Gating ---
+        # For KNOWN landmarks, we should be more permissive
+        # Large residuals after long dead-reckoning are EXPECTED and should be corrected
         try:
             S_inv = np.linalg.inv(S)
             mahalanobis_sq = z_res @ S_inv @ z_res
@@ -654,25 +782,36 @@ class EKFNode(Node):
             return
 
         pixel_residual = np.linalg.norm(z_res)
+        mahal_dist = np.sqrt(mahalanobis_sq)
 
-        if mahalanobis_sq > self.mahalanobis_threshold**2:
+        # Adaptive gating: if covariance is large, allow larger corrections
+        # Chi-squared 99% for 2 DOF is 9.21, 99.9% is 13.82
+        # Since we KNOW landmark positions, we can be more aggressive
+        adaptive_threshold = max(self.mahalanobis_threshold, 10.0)
+
+        if mahal_dist > adaptive_threshold:
             self.consecutive_outliers += 1
 
-            # If too many consecutive outliers, the filter has diverged
-            # Reset position covariance to allow larger corrections
+            # If too many consecutive outliers, the filter has likely diverged
+            # Expand covariance to allow correction on next measurement
             if self.consecutive_outliers >= self.max_consecutive_outliers:
-                self.get_logger().warn(f"FILTER RECOVERY: {self.consecutive_outliers} consecutive outliers. Resetting P!")
-                self.P[0:3, 0:3] = np.eye(3) * 1.0   # Large position uncertainty
-                self.P[3:6, 3:6] = np.eye(3) * 0.5  # Large velocity uncertainty
+                self.get_logger().warn(f"FILTER RECOVERY: {self.consecutive_outliers} outliers. Expanding covariance!")
+                self.P[0:3, 0:3] = np.eye(3) * 10.0   # Very large position uncertainty
+                self.P[3:6, 3:6] = np.eye(3) * 1.0   # Large velocity uncertainty
+                self.P[6:9, 6:9] = np.eye(3) * 0.5   # Moderate orientation uncertainty
                 self.consecutive_outliers = 0
                 # Don't fuse this one, but next update will go through
                 return
 
-            self.get_logger().warn(f"Outlier Rejected! Residual: {pixel_residual:.1f} px, Mahal: {np.sqrt(mahalanobis_sq):.1f}")
+            self.get_logger().warn(f"Outlier Rejected! Residual: {pixel_residual:.1f} px, Mahal: {mahal_dist:.1f} (thresh={adaptive_threshold:.1f})")
             return
 
         # Good measurement - reset outlier counter
         self.consecutive_outliers = 0
+
+        # Log successful updates for debugging
+        if pixel_residual > 20.0:
+            self.get_logger().info(f"Vision correction: {pixel_residual:.1f} px, Mahal: {mahal_dist:.1f}")
 
         try:
             K = self.P @ H.T @ S_inv
