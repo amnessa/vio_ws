@@ -32,11 +32,23 @@ class VisionNode(Node):
         self.lower_red2 = np.array([170, 70, 50])
         self.upper_red2 = np.array([180, 255, 255])
 
-        # Green range
+        # Green range (ID 2)
         self.lower_green = np.array([40, 70, 50])
         self.upper_green = np.array([80, 255, 255])
 
-        self.get_logger().info("Vision Node Started. Waiting for images...")
+        # Blue range (ID 3)
+        self.lower_blue = np.array([100, 70, 50])
+        self.upper_blue = np.array([130, 255, 255])
+
+        # Yellow range (ID 4)
+        self.lower_yellow = np.array([20, 70, 50])
+        self.upper_yellow = np.array([35, 255, 255])
+
+        # Cyan range (ID 5)
+        self.lower_cyan = np.array([80, 70, 50])
+        self.upper_cyan = np.array([100, 255, 255])
+
+        self.get_logger().info("Vision Node Started. Detecting 5 landmarks (Red, Green, Blue, Yellow, Cyan)...")
 
     def image_callback(self, msg):
         try:
@@ -55,6 +67,9 @@ class VisionNode(Node):
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
 
         mask_green = cv2.inRange(hsv, self.lower_green, self.upper_green)
+        mask_blue = cv2.inRange(hsv, self.lower_blue, self.upper_blue)
+        mask_yellow = cv2.inRange(hsv, self.lower_yellow, self.upper_yellow)
+        mask_cyan = cv2.inRange(hsv, self.lower_cyan, self.upper_cyan)
 
         # Detect blobs
         landmarks_msg = PoseArray()
@@ -65,6 +80,15 @@ class VisionNode(Node):
 
         # Process Green (ID 2)
         self.detect_and_add(mask_green, 2.0, landmarks_msg, cv_image, (0, 255, 0))
+
+        # Process Blue (ID 3)
+        self.detect_and_add(mask_blue, 3.0, landmarks_msg, cv_image, (255, 0, 0))
+
+        # Process Yellow (ID 4)
+        self.detect_and_add(mask_yellow, 4.0, landmarks_msg, cv_image, (0, 255, 255))
+
+        # Process Cyan (ID 5)
+        self.detect_and_add(mask_cyan, 5.0, landmarks_msg, cv_image, (255, 255, 0))
 
         # Publish detections
         self.publisher_.publish(landmarks_msg)

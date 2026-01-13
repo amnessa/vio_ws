@@ -87,10 +87,13 @@ class EKFNode(Node):
         self.max_time_delay = 0.05  # 50ms tolerance
 
         # Landmarks (Known Map from landmarks.sdf)
-        # ID 1: Red, ID 2: Green
+        # ID 1: Red, ID 2: Green, ID 3: Blue, ID 4: Yellow, ID 5: Cyan
         self.map = {
-            1.0: np.array([2.0, 2.0, 0.5]),
-            2.0: np.array([4.0, -2.0, 0.5])
+            1.0: np.array([2.0, 2.0, 0.5]),    # Red
+            2.0: np.array([4.0, -2.0, 0.5]),   # Green
+            3.0: np.array([-2.0, 3.0, 0.5]),   # Blue
+            4.0: np.array([5.0, 3.0, 0.5]),    # Yellow
+            5.0: np.array([-3.0, -3.0, 0.5])   # Cyan
         }
 
         # Calibration (Extrinsics: Base -> Camera)

@@ -70,5 +70,41 @@
         </visual>
       </link>
     </model>
+
+    <!-- Landmark 3: Blue cylinder -->
+    <model name="landmark_3">
+      <static>true</static>
+      <pose>-2 3 0.5 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><cylinder><radius>0.1</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>0 0 1 1</ambient><diffuse>0 0 1 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Landmark 4: Yellow cylinder -->
+    <model name="landmark_4">
+      <static>true</static>
+      <pose>5 3 0.5 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><cylinder><radius>0.1</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>1 1 0 1</ambient><diffuse>1 1 0 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Landmark 5: Cyan cylinder -->
+    <model name="landmark_5">
+      <static>true</static>
+      <pose>-3 -3 0.5 0 0 0</pose>
+      <link name="link">
+        <visual name="v">
+          <geometry><cylinder><radius>0.1</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>0 1 1 1</ambient><diffuse>0 1 1 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
   </world>
 </sdf>
