@@ -9,6 +9,35 @@ from tf2_ros import TransformBroadcaster
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+
+def skew_symmetric(v):
+    """
+    Compute the skew-symmetric (cross-product) matrix of a 3D vector.
+    Used extensively in Jacobian calculations for ES-EKF.
+    [v]_× such that [v]_× @ u = v × u
+
+    Reference: MatthewHampsey/mekf util.py
+    """
+    return np.array([
+        [0.0, -v[2], v[1]],
+        [v[2], 0.0, -v[0]],
+        [-v[1], v[0], 0.0]
+    ])
+
+
+def quat_to_rotation_matrix(q):
+    """
+    Convert quaternion [w, x, y, z] to rotation matrix.
+    Uses the closed-form formula for efficiency.
+
+    Reference: MatthewHampsey/mekf util.py (quatToMatrix)
+    """
+    w, x, y, z = q
+    # Using scipy for robustness
+    rot = R.from_quat([x, y, z, w])  # scipy uses [x, y, z, w]
+    return rot.as_matrix()
+
+
 class EKFNode(Node):
     def __init__(self):
         super().__init__('ekf_node')
@@ -249,71 +278,98 @@ class EKFNode(Node):
         self.get_logger().info("=== EKF INITIALIZED - Starting state estimation ===")
 
     def predict(self, dt, a_m, w_m):
-        # Unpack State
-        p = self.x[0:3]
-        v = self.x[3:6]
-        q = self.x[6:10]
-        ba = self.x[10:13]
-        bg = self.x[13:16]
+        """
+        ES-EKF / MEKF Prediction Step (IMU Odometry Model)
 
-        # Rotation Matrix R_wb
-        rot = R.from_quat([q[1], q[2], q[3], q[0]]) # Scipy uses [x, y, z, w]
+        This implements the prediction step of the Error-State Extended Kalman Filter
+        following the multiplicative quaternion formulation from MatthewHampsey/mekf.
+
+        The prediction consists of two parallel processes:
+        1. Nominal State Propagation - Non-linear kinematics integration
+        2. Error Covariance Propagation - Linearized uncertainty propagation
+
+        Error State Vector (15D): [δp(3), δv(3), δθ(3), δba(3), δbg(3)]
+        - δθ uses minimal 3D angular representation to avoid quaternion rank deficiency
+
+        Reference: prediction_step.md, es_ekf_handbook.md
+        """
+        # ===================================================================
+        # STEP 0: Unpack State and Compute Bias-Corrected Measurements
+        # ===================================================================
+        p = self.x[0:3]      # Position
+        v = self.x[3:6]      # Velocity
+        q = self.x[6:10]     # Quaternion [w, x, y, z]
+        ba = self.x[10:13]   # Accelerometer bias
+        bg = self.x[13:16]   # Gyroscope bias
+
+        # Rotation Matrix R_wb (body to world)
+        rot = R.from_quat([q[1], q[2], q[3], q[0]])  # scipy uses [x, y, z, w]
         R_wb = rot.as_matrix()
 
-        # 1. Nominal State Propagation
-        # Bias corrected measurements
-        a_unbiased = a_m - ba
-        w_unbiased = w_m - bg
-        # Use calibrated gravity from initialization (not hardcoded 9.81)
+        # Bias-corrected IMU measurements
+        a_corrected = a_m - ba  # Corrected acceleration in body frame
+        w_corrected = w_m - bg  # Corrected angular velocity in body frame
 
-        # --- GRAVITY CHECK DEBUG ---
-        # This should be near [0, 0, 0] when stationary if quaternion is correct.
-        # If any component is large (~10-20), the quaternion order is wrong.
-        acc_world = R_wb @ a_unbiased - self.g
+        # ===================================================================
+        # STEP 1: Nominal State Propagation (Non-linear Kinematics)
+        # ===================================================================
+        # Acceleration in world frame (gravity compensated)
+        acc_world = R_wb @ a_corrected - self.g
 
-        # --- watchdog: detect explosion ---
-        # if the robot thinks its is accelerating > 5m/s^2 it is likely broken
-        # this resets the velocity/tilt to stop the explosion
+        # --- Divergence Watchdog ---
+        # If acceleration is unreasonably large, reset the filter
         if np.linalg.norm(acc_world) > 5.0:
             self.get_logger().error(f"Filter Divergence! Accel: {np.linalg.norm(acc_world):.1f} m/s^2. Resetting...")
-            self.x[3:6] = 0.0  # Reset Velocity
-            self.x[7:10] = 0.0 # Reset Tilt (x, y, z components of quat)
-            self.x[6] = 1.0    # Reset w component
-
+            self.x[3:6] = 0.0   # Reset Velocity
+            self.x[7:10] = 0.0  # Reset quaternion vector part
+            self.x[6] = 1.0     # Reset quaternion scalar
             self.x[10:16] = 0.0 # Reset Biases
-            self.P = np.eye(15) * 1.0 # Reset Covariance
-            return # Skip integration this step
+            self.P = np.eye(15) * 1.0  # Reset Covariance
+            return
 
+        # Debug logging (every ~2 seconds at 200Hz)
         if not hasattr(self, '_debug_counter'):
             self._debug_counter = 0
         self._debug_counter += 1
-        if self._debug_counter % 400 == 1:  # Log every 2 seconds at 200Hz
+        if self._debug_counter % 400 == 1:
             self.get_logger().info(f"World Accel (should be ~0): [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2")
 
-        # Position
-        p_new = p + v * dt + 0.5 * (R_wb @ a_unbiased - self.g) * dt**2
-        # Velocity
-        v_new = v + (R_wb @ a_unbiased - self.g) * dt
-        # Orientation (Quaternion integration)
-        # exp_map for rotation vector w * dt
-        w_norm = np.linalg.norm(w_unbiased)
-        if w_norm > 1e-6:
-            axis = w_unbiased / w_norm
-            angle = w_norm * dt
-            # Quaternion for small rotation [sin(a/2)u, cos(a/2)]
-            dq = np.hstack([np.sin(angle/2)*axis, np.cos(angle/2)]) # [x,y,z,w]
-            # Combine: q_new = q * dq
-            # Note: Scipy multiplication is q2 * q1 (q2 applied after)
-            q_new_obj = rot * R.from_quat(dq)
-            q_new = q_new_obj.as_quat() # [x,y,z,w]
-            # Store as [w, x, y, z] for our state convention
-            q_new = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
-        else:
-            q_new = q
+        # --- Position Update ---
+        # p_k = p_{k-1} + v_{k-1}*dt + 0.5*(R*a_corrected - g)*dt^2
+        p_new = p + v * dt + 0.5 * acc_world * dt**2
 
-        # Biases (Random Walk) -> Constant in prediction mean
-        ba_new = ba
-        bg_new = bg
+        # --- Velocity Update ---
+        # v_k = v_{k-1} + (R*a_corrected - g)*dt
+        v_new = v + acc_world * dt
+
+        # --- Orientation Update (Quaternion Integration) ---
+        # Using quaternion exponential map: q_k = q_{k-1} ⊗ exp(0.5 * ω_corrected * dt)
+        # Reference: MatthewHampsey/mekf model.py - quaternion derivative method
+        w_norm = np.linalg.norm(w_corrected)
+        if w_norm > 1e-8:
+            # Exact quaternion exponential for rotation vector θ = ω*dt
+            # Δq = [cos(|θ|/2), sin(|θ|/2) * θ/|θ|]
+            half_angle = 0.5 * w_norm * dt
+            axis = w_corrected / w_norm
+            dq = np.array([
+                axis[0] * np.sin(half_angle),
+                axis[1] * np.sin(half_angle),
+                axis[2] * np.sin(half_angle),
+                np.cos(half_angle)
+            ])  # [x, y, z, w] for scipy
+
+            # Quaternion multiplication: q_new = q_old ⊗ dq
+            q_new_obj = rot * R.from_quat(dq)
+            q_new_scipy = q_new_obj.as_quat()  # [x, y, z, w]
+            q_new = np.array([q_new_scipy[3], q_new_scipy[0], q_new_scipy[1], q_new_scipy[2]])
+        else:
+            # For very small rotations, quaternion stays the same
+            q_new = q.copy()
+
+        # --- Bias Update (Random Walk Model) ---
+        # Biases are constant in the prediction step (drift added via process noise)
+        ba_new = ba.copy()
+        bg_new = bg.copy()
 
         # Update Nominal State
         self.x[0:3] = p_new
@@ -322,36 +378,106 @@ class EKFNode(Node):
         self.x[10:13] = ba_new
         self.x[13:16] = bg_new
 
-        # 2. Covariance Propagation (Linearization)
-        # Fx (15x15) Jacobian of error state
-        Fx = np.eye(15)
+        # ===================================================================
+        # STEP 2: Error Covariance Propagation (Linearized Uncertainty)
+        # ===================================================================
+        # The error state Jacobian Fx describes how errors propagate.
+        # Fx ≈ I + F*dt where F is the continuous-time error dynamics matrix.
+        #
+        # Reference: MatthewHampsey/mekf kalman2.py lines 55-69
+        #
+        # Error state ordering: [δp, δv, δθ, δba, δbg]
+        #                       [0:3, 3:6, 6:9, 9:12, 12:15]
 
-        # Position block
-        Fx[0:3, 3:6] = np.eye(3) * dt
+        # Construct continuous-time Jacobian F
+        F = np.zeros((15, 15))
 
-        # Velocity block
-        # d(v)/d(theta) = -R * [a]_x * dt
-        a_skew = np.array([[0, -a_unbiased[2], a_unbiased[1]],
-                           [a_unbiased[2], 0, -a_unbiased[0]],
-                           [-a_unbiased[1], a_unbiased[0], 0]])
-        Fx[3:6, 6:9] = -R_wb @ a_skew * dt
-        Fx[3:6, 9:12] = -R_wb * dt # d(v)/d(ba)
+        # --- Position error dynamics ---
+        # δṗ = δv
+        F[0:3, 3:6] = np.eye(3)
 
-        # Orientation block
-        # d(theta)/d(theta) = I - [w]_x * dt (approx for small dt)
-        # d(theta)/d(bg) = -I * dt
-        Fx[6:9, 12:15] = -np.eye(3) * dt
+        # --- Velocity error dynamics ---
+        # δv̇ = -R*[a_corrected]_× * δθ - R * δba
+        # d(δv)/d(δθ): Rotation of body-frame acceleration by orientation error
+        F[3:6, 6:9] = -R_wb @ skew_symmetric(a_corrected)
+        # d(δv)/d(δba): Effect of accel bias error on velocity
+        F[3:6, 9:12] = -R_wb
 
-        # Noise Matrix Q (discrete)
-        # Simple approx: Q = G * Q_continuous * G.T * dt
-        # We assume diagonal Q for simplicity here
+        # --- Orientation error dynamics ---
+        # δθ̇ = -[ω_corrected]_× * δθ - δbg
+        # d(δθ)/d(δθ): Gyro measurement coupling (MEKF key insight!)
+        # Reference: MatthewHampsey/mekf kalman2.py line 66: G[0:3, 0:3] = -skewSymmetric(gyro_meas)
+        F[6:9, 6:9] = -skew_symmetric(w_corrected)
+        # d(δθ)/d(δbg): Effect of gyro bias error on orientation
+        F[6:9, 12:15] = -np.eye(3)
+
+        # --- Bias error dynamics ---
+        # δḃa = 0, δḃg = 0 (Random walk - noise added separately)
+        # F[9:12, 9:12] = 0 (already zero)
+        # F[12:15, 12:15] = 0 (already zero)
+
+        # Discrete-time state transition: Fx = I + F*dt
+        Fx = np.eye(15) + F * dt
+
+        # ===================================================================
+        # STEP 3: Process Noise Covariance Q
+        # ===================================================================
+        # The process noise captures uncertainty from IMU sensor noise and bias drift.
+        #
+        # Reference: MatthewHampsey/mekf kalman2.py process_covariance()
+        # Uses Van Loan method for proper discrete-time noise covariance.
+        #
+        # Simplified version with primary diagonal and key cross-terms:
+
+        # Noise covariance matrices (3x3)
+        Q_gyro = self.Q_g * np.eye(3)        # Gyro noise variance
+        Q_gyro_bias = self.Q_bg * np.eye(3)  # Gyro bias random walk
+        Q_accel = self.Q_a * np.eye(3)       # Accel noise variance
+        Q_accel_bias = self.Q_ba * np.eye(3) # Accel bias random walk
+
+        # Build discrete process noise matrix Q
+        # Following the structure from MatthewHampsey/mekf kalman2.py
         Qi = np.zeros((15, 15))
-        Qi[3:6, 3:6] = np.eye(3) * self.Q_a * dt**2 # v noise from accel
-        Qi[6:9, 6:9] = np.eye(3) * self.Q_g * dt**2 # theta noise from gyro
-        Qi[9:12, 9:12] = np.eye(3) * self.Q_ba * dt # ba random walk
-        Qi[12:15, 12:15] = np.eye(3) * self.Q_bg * dt # bg random walk
 
+        # Position noise (from velocity integration of acceleration noise)
+        # Q_p = Q_a * dt^4/4 + Q_ba * dt^6/36 (approximated)
+        Qi[0:3, 0:3] = Q_accel * (dt**4 / 4.0)
+
+        # Velocity noise (from acceleration noise)
+        # Q_v = Q_a * dt^2 + higher order terms
+        Qi[3:6, 3:6] = Q_accel * dt + Q_accel_bias * (dt**3 / 3.0)
+
+        # Position-Velocity cross-correlation
+        Qi[0:3, 3:6] = Q_accel * (dt**3 / 2.0)
+        Qi[3:6, 0:3] = Qi[0:3, 3:6].T
+
+        # Orientation noise (from gyro noise)
+        # Q_θ = Q_g * dt + Q_bg * dt^3/3
+        Qi[6:9, 6:9] = Q_gyro * dt + Q_gyro_bias * (dt**3 / 3.0)
+
+        # Orientation-Gyro bias cross-correlation
+        # Reference: MatthewHampsey/mekf - Q[0:3, 9:12] = -gyro_bias_cov*(dt^2)/2
+        Qi[6:9, 12:15] = -Q_gyro_bias * (dt**2 / 2.0)
+        Qi[12:15, 6:9] = Qi[6:9, 12:15].T
+
+        # Accel bias random walk
+        Qi[9:12, 9:12] = Q_accel_bias * dt
+
+        # Velocity-Accel bias cross-correlation
+        Qi[3:6, 9:12] = -Q_accel_bias * (dt**2 / 2.0)
+        Qi[9:12, 3:6] = Qi[3:6, 9:12].T
+
+        # Gyro bias random walk
+        Qi[12:15, 12:15] = Q_gyro_bias * dt
+
+        # ===================================================================
+        # STEP 4: Covariance Update
+        # ===================================================================
+        # P_{k|k-1} = Fx * P_{k-1|k-1} * Fx^T + Q
         self.P = Fx @ self.P @ Fx.T + Qi
+
+        # Ensure symmetry (numerical stability)
+        self.P = 0.5 * (self.P + self.P.T)
 
         # # --- GRAVITY-BASED ATTITUDE CORRECTION ---
         # # Use accelerometer to provide roll/pitch reference (complementary filter style)
@@ -502,11 +628,8 @@ class EKFNode(Node):
         J_pos = -self.R_b_c @ R_wb.T
 
         # w.r.t Orientation theta (in body frame):
-        # d(pc)/d(theta) = R_bc * [p_b]x (skew symmetric of point in body)
-        p_b_skew = np.array([[0, -p_b[2], p_b[1]],
-                             [p_b[2], 0, -p_b[0]],
-                             [-p_b[1], p_b[0], 0]])
-        J_rot = self.R_b_c @ p_b_skew
+        # d(pc)/d(theta) = R_bc * [p_b]_× (skew symmetric of point in body)
+        J_rot = self.R_b_c @ skew_symmetric(p_b)
 
         # Assemble H (2x15)
         H = np.zeros((2, 15))
