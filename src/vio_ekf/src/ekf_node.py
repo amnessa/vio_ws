@@ -46,7 +46,7 @@ class EKFNode(Node):
         # Collect IMU samples while stationary to estimate biases and initial orientation
         self.initialized = False
         self.init_samples = []
-        self.init_sample_count = 200  # Reduced from 2400 (1 second at 200Hz)
+        self.init_sample_count = 2400  # Reduced from 2400 (1 second at 200Hz)
         self.gravity_magnitude = 9.81  # Expected gravity magnitude (will be updated from IMU)
         self.g = np.array([0.0, 0.0, 9.81])  # Gravity vector in world frame (will be updated)
 
@@ -395,24 +395,33 @@ class EKFNode(Node):
         # Ground constraint: Z position should be 0
         self.x[2] = 0.0
 
-        # Per recommendation.md: Do NOT reset biases to zero!
-        # If we reset biases, the divergence will immediately restart.
-        # Instead, keep current bias estimates but increase their uncertainty
-        # so the filter can re-learn them if they're wrong.
-        # Only clip to reasonable bounds.
+        # CRITICAL FIX: Reset biases when they're saturated!
+        # If biases hit their limits, the filter was already diverging and the
+        # bias estimates are garbage. Using saturated biases corrupts the
+        # gravity-based orientation estimate, causing immediate re-divergence.
         MAX_ACCEL_BIAS = 0.5
         MAX_GYRO_BIAS = 0.1
-        self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
-        self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
 
-        self.get_logger().info(f"Keeping biases: accel=[{self.x[10]:.3f}, {self.x[11]:.3f}, {self.x[12]:.3f}], "
-                               f"gyro=[{self.x[13]:.4f}, {self.x[14]:.4f}, {self.x[15]:.4f}]")
+        # Check if biases are near saturation (within 10% of limit)
+        accel_bias_saturated = np.any(np.abs(self.x[10:13]) > MAX_ACCEL_BIAS * 0.9)
+        gyro_bias_saturated = np.any(np.abs(self.x[13:16]) > MAX_GYRO_BIAS * 0.9)
+
+        if accel_bias_saturated or gyro_bias_saturated:
+            self.get_logger().warn("Biases saturated! Resetting to zero for clean recovery.")
+            self.x[10:13] = 0.0  # Reset accel bias
+            self.x[13:16] = 0.0  # Reset gyro bias
+        else:
+            # Keep reasonable biases but clip just in case
+            self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
+            self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
+            self.get_logger().info(f"Keeping biases: accel=[{self.x[10]:.3f}, {self.x[11]:.3f}, {self.x[12]:.3f}], "
+                                   f"gyro=[{self.x[13]:.4f}, {self.x[14]:.4f}, {self.x[15]:.4f}]")
 
         # Expand covariance to reflect uncertainty after reset
         self.P[0:3, 0:3] = np.eye(3) * 1.0    # Position uncertainty
         self.P[3:6, 3:6] = np.eye(3) * 0.5    # Velocity uncertainty
         self.P[6:9, 6:9] = np.eye(3) * 0.3    # Orientation uncertainty
-        self.P[9:12, 9:12] = np.eye(3) * 0.1  # Accel bias uncertainty (allow re-estimation)
+        self.P[9:12, 9:12] = np.eye(3) * 0.2  # Accel bias - higher uncertainty to re-learn
         self.P[12:15, 12:15] = np.eye(3) * 0.1  # Gyro bias uncertainty
 
         self.get_logger().info(f"Re-initialized quat: w={self.x[6]:.3f}, x={self.x[7]:.3f}, y={self.x[8]:.3f}, z={self.x[9]:.3f}")
@@ -1014,9 +1023,16 @@ class EKFNode(Node):
                     'id': lid
                 })
 
-        # Perform batch update if we have observations
-        if len(observations) >= 1:
+        # Perform batch update only with 2+ markers for observability
+        # Single-marker updates cause position-yaw coupling errors and are the
+        # primary cause of "6km jumps" in high-drift states
+        if len(observations) >= 2:
             self.batch_update(observations, buffered_state)
+        elif len(observations) == 1:
+            self.get_logger().info(
+                f"Skipping single-marker update (ID={observations[0]['id']:.0f}) - need 2+ for observability",
+                throttle_duration_sec=1.0
+            )
 
     def batch_update(self, observations, buffered_state=None):
         """
@@ -1104,30 +1120,30 @@ class EKFNode(Node):
             J_pos = -self.R_b_c @ R_wb.T
 
             # Jacobian w.r.t Orientation (using skew symmetric)
-            # Per recommend.md: For local error definition (q_new = q_curr * dq),
-            # δθ is in body frame. The Jacobian must account for how body rotation
-            # affects the landmark position in camera frame.
-            #
-            # p_b = R_wb^T @ (p_w_lm - p_w)
-            # dp_b/dδθ = -[p_b]_× (for local error, rotation of body frame)
-            # p_c = R_b_c @ (p_b - t_b_c)
-            # dp_c/dp_b = R_b_c
-            # Therefore: dp_c/dδθ = R_b_c @ (-[p_b]_×) = -R_b_c @ [p_b]_×
-            #
-            # DISABLED: Vision orientation updates cause instability with known map
-            # Let IMU + ZUPT gravity update handle orientation
+            # DISABLED: Orientation updates from vision cause instability.
+            # The Jacobian derivation may have sign/convention errors.
+            # Let IMU prediction + ZUPT gravity updates handle orientation.
             # J_rot = -self.R_b_c @ skew_symmetric(p_b)
 
             # Assemble H (2x15) for this landmark - POSITION ONLY
             H = np.zeros((2, 15))
             H[:, 0:3] = J_proj @ J_pos
-            # H[:, 6:9] = J_proj @ J_rot  # DISABLED - vision updates position only
+            # H[:, 6:9] = J_proj @ J_rot  # DISABLED
 
             z_res_stack.append(z_res)
             H_stack.append(H)
             valid_count += 1
 
         if valid_count == 0:
+            return
+
+        # Enforce 2+ marker requirement for observability (position + yaw)
+        # Single marker updates cause position-yaw coupling errors
+        if valid_count < 2:
+            self.get_logger().info(
+                f"Skipping update: only {valid_count} valid marker(s) after filtering",
+                throttle_duration_sec=1.0
+            )
             return
 
         # Stack into matrices
@@ -1218,37 +1234,44 @@ class EKFNode(Node):
 
         # --- Inject Error into Nominal State ---
 
-        # Position correction
-        self.x[0:3] += dx[0:3]
+        # Compute correction magnitudes for sanity checking
+        pos_corr_norm = np.linalg.norm(dx[0:3])
+        vel_corr_norm = np.linalg.norm(dx[3:6])
+        rot_corr_norm = np.linalg.norm(dx[6:9])
+        rot_corr_deg = np.degrees(rot_corr_norm)
 
-        # Velocity correction (soft limit) - CONSERVATIVE to prevent explosion
+        # Reject updates with extreme corrections (linearization failure)
+        if pos_corr_norm > 3.0 or vel_corr_norm > 5.0 or rot_corr_deg > 45.0:
+            self.get_logger().error(
+                f"LINEARIZATION FAILURE: pos={pos_corr_norm:.2f}m, vel={vel_corr_norm:.2f}m/s, "
+                f"rot={rot_corr_deg:.1f}deg. Skipping update."
+            )
+            return
+
+        # Position correction with clipping
+        pos_correction = dx[0:3]
+        MAX_POS_CORRECTION = 0.5
+        if pos_corr_norm > MAX_POS_CORRECTION:
+            pos_correction = pos_correction * (MAX_POS_CORRECTION / pos_corr_norm)
+            self.get_logger().warn(f"Position correction clipped: {pos_corr_norm:.2f} -> {MAX_POS_CORRECTION} m")
+        self.x[0:3] += pos_correction
+
+        # Velocity correction with clipping
         vel_correction = dx[3:6]
-        vel_corr_norm = np.linalg.norm(vel_correction)
-        if vel_corr_norm > 0.3:  # Reduced from 2.0 to 0.3 m/s
-            vel_correction = vel_correction * (0.3 / vel_corr_norm)
-            self.get_logger().warn(f"Velocity correction clipped: {vel_corr_norm:.2f} -> 0.3 m/s")
+        MAX_VEL_CORRECTION = 0.3
+        if vel_corr_norm > MAX_VEL_CORRECTION:
+            vel_correction = vel_correction * (MAX_VEL_CORRECTION / vel_corr_norm)
+            self.get_logger().warn(f"Velocity correction clipped: {vel_corr_norm:.2f} -> {MAX_VEL_CORRECTION} m/s")
         self.x[3:6] += vel_correction
 
-        # Orientation correction (quaternion multiply)
-        rot_correction = dx[6:9]
-        rot_corr_norm = np.linalg.norm(rot_correction)
-        if rot_corr_norm > 0.5:
-            rot_correction = rot_correction * (0.5 / rot_corr_norm)
-        dq_rot = R.from_rotvec(rot_correction)
-        q_curr_obj = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])
-        q_new_obj = q_curr_obj * dq_rot
-        q_new = q_new_obj.as_quat()
-        self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
+        # CRITICAL: Vision doesn't observe orientation (H[:,6:9]=0), so any non-zero
+        # dx[6:9] comes from P cross-correlations, NOT actual observability.
+        # These "phantom" corrections cause the filter to spin out of control.
+        dx[6:9] = 0.0    # Zero orientation correction
+        dx[9:12] = 0.0   # Zero accel bias correction
+        dx[12:15] = 0.0  # Zero gyro bias correction
 
-        # Bias corrections
-        self.x[10:13] += dx[9:12]
-        self.x[13:16] += dx[12:15]
-
-        # Bias magnitude limits
-        MAX_ACCEL_BIAS = 0.5
-        MAX_GYRO_BIAS = 0.1
-        self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
-        self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
+        # Orientation is handled by IMU prediction + ZUPT gravity updates
 
         # Ground constraints - state only, NOT covariance
         # Per recommend.md: Don't zero covariance rows as it creates near-singular matrix
@@ -1273,6 +1296,16 @@ class EKFNode(Node):
         if speed > MAX_SPEED:
             self.x[3:5] = self.x[3:5] * (MAX_SPEED / speed)
             self.get_logger().warn(f"Speed clamped from {speed:.2f} to {MAX_SPEED} m/s")
+
+        # Position sanity check - TurtleBot shouldn't be more than ~50m from origin in typical use
+        MAX_POS = 50.0  # meters from origin
+        pos_norm = np.linalg.norm(self.x[0:2])
+        if pos_norm > MAX_POS:
+            self.get_logger().error(f"Position exploded to {pos_norm:.1f}m! Resetting to origin.")
+            self.x[0:2] = np.array([0.0, 0.0])
+            self.x[3:5] = np.array([0.0, 0.0])  # Reset velocity too
+            self.P[0:3, 0:3] = np.eye(3) * 2.0  # High position uncertainty
+            self.P[3:6, 3:6] = np.eye(3) * 0.5  # High velocity uncertainty
 
         # Log update
         q = self.x[6:10]
@@ -1412,40 +1445,30 @@ class EKFNode(Node):
         self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ (np.eye(2) * self.R_cam) @ K.T
 
         # 4. Inject Error into Nominal State
-        # NOTE: Removed hard-clipping per recommendations.md
-        # Hard clipping prevents proper convergence and causes persistent innovations.
-        # The Kalman filter is designed to handle large residuals through its math.
-        # We only apply soft limits for safety (log but don't clip unless extreme)
+        # CRITICAL FIX: Since H[:,6:9] = 0 (vision doesn't observe orientation),
+        # any non-zero dx[6:9] comes from P cross-correlations, NOT from actual
+        # orientation observability. Zero out phantom corrections.
+        dx[6:9] = 0.0    # orientation - not observed by vision
+        dx[9:12] = 0.0   # accel bias - not observed by vision
+        dx[12:15] = 0.0  # gyro bias - not observed by vision
 
-        # Position correction (no hard clip - let EKF work)
+        # Position correction
         pos_correction = dx[0:3]
-        if np.linalg.norm(pos_correction) > 1.0:
-            self.get_logger().info(f"Large position correction: {np.linalg.norm(pos_correction):.2f}m", throttle_duration_sec=1.0)
+        pos_corr_norm = np.linalg.norm(pos_correction)
+        if pos_corr_norm > 0.5:  # Limit per-update correction
+            pos_correction = pos_correction * (0.5 / pos_corr_norm)
+            self.get_logger().warn(f"Position correction clipped: {pos_corr_norm:.2f}m", throttle_duration_sec=1.0)
         self.x[0:3] += pos_correction
 
-        # Velocity correction (soft limit only for extreme cases)
+        # Velocity correction
         vel_correction = dx[3:6]
         vel_corr_norm = np.linalg.norm(vel_correction)
-        if vel_corr_norm > 2.0:  # Only clip truly extreme corrections
-            self.get_logger().warn(f"Extreme velocity correction clipped: {vel_corr_norm:.2f} m/s", throttle_duration_sec=1.0)
-            vel_correction = vel_correction * (2.0 / vel_corr_norm)
+        if vel_corr_norm > 0.3:  # Conservative limit
+            vel_correction = vel_correction * (0.3 / vel_corr_norm)
+            self.get_logger().warn(f"Velocity correction clipped: {vel_corr_norm:.2f}m/s", throttle_duration_sec=1.0)
         self.x[3:6] += vel_correction
 
-        # Orientation (Quaternion multiply) - soft limit for extreme cases only
-        rot_correction = dx[6:9]
-        rot_corr_norm = np.linalg.norm(rot_correction)
-        if rot_corr_norm > 0.5:  # ~30 degrees - truly extreme
-            self.get_logger().warn(f"Extreme rotation correction clipped: {np.degrees(rot_corr_norm):.1f} deg", throttle_duration_sec=1.0)
-            rot_correction = rot_correction * (0.5 / rot_corr_norm)
-        dq_rot = R.from_rotvec(rot_correction)
-        q_curr_obj = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]]) # [x,y,z,w]
-        q_new_obj = q_curr_obj * dq_rot
-        q_new = q_new_obj.as_quat()
-        self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
-
-        # Biases - apply corrections (EKF handles the rate naturally through P)
-        self.x[10:13] += dx[9:12]
-        self.x[13:16] += dx[12:15]
+        # Biases - NOT updated from vision (set to zero above)
 
         # Enforce bias magnitude limits (physical bounds, not rate limits)
         MAX_ACCEL_BIAS = 0.5  # m/s² - realistic MEMS limit
