@@ -392,7 +392,7 @@
     </link>
 
     <link name="camera_link">
-      <pose>0.076 0.0 0.093 0 0 0</pose>
+      <pose>0.10 0.0 0.093 0 0 0</pose>  <!-- Moved forward from 0.076 to 0.10 -->
       <inertial>
         <inertia>
           <ixx>0.001</ixx>
@@ -404,28 +404,21 @@
         </inertia>
         <mass>0.035</mass>
       </inertial>
-      <visual name="camera_visual">
-        <geometry>
-          <mesh>
-            <uri>model://turtlebot3_common/meshes/sensors/r200.dae</uri>
-            <scale>0.001 0.001 0.001</scale>
-          </mesh>
-        </geometry>
-      </visual>
+      <!-- Visual mesh removed - was blocking camera view -->
       <sensor name="camera" type="camera">
         <always_on>true</always_on>
         <visualize>false</visualize>
         <update_rate>10</update_rate>
         <topic>/camera</topic>
         <camera name="picam">
-          <horizontal_fov>2.00</horizontal_fov> <!-- modified from 1.085595 -->
+          <horizontal_fov>2.50</horizontal_fov> <!-- ~143 degrees for wider view -->
           <image>
-              <width>640</width>
-              <height>480</height>
+              <width>1280</width>
+              <height>720</height>
               <format>R8G8B8</format>
           </image>
           <clip>
-              <near>0.03</near>
+              <near>0.01</near>  <!-- Reduced from 0.03 to see closer objects -->
               <far>100</far>
           </clip>
           <noise>

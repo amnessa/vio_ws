@@ -59,149 +59,153 @@
     </include>
 
     <!-- ArUco Marker Landmarks (Circular arrangement facing center) -->
+    <!-- 3 rings at 1.4m, 2.8m, 4.2m radius (30% smaller), markers at 0.30m height -->
 
+    <!-- Ring 1: 1.4m radius, 8 markers -->
     <include>
       <uri>model://aruco_0</uri>
       <name>landmark_0</name>
-      <pose>2.00 0.00 0.40 0.0000 1.5708 0.0000</pose>
+      <pose>1.40 0.00 0.30 0.0000 1.5708 0.0000</pose>
     </include>
 
     <include>
       <uri>model://aruco_1</uri>
       <name>landmark_1</name>
-      <pose>1.41 1.41 0.40 0.0000 1.5708 0.7854</pose>
+      <pose>0.99 0.99 0.30 0.0000 1.5708 0.7854</pose>
     </include>
 
     <include>
       <uri>model://aruco_2</uri>
       <name>landmark_2</name>
-      <pose>0.00 2.00 0.40 0.0000 1.5708 1.5708</pose>
+      <pose>0.00 1.40 0.30 0.0000 1.5708 1.5708</pose>
     </include>
 
     <include>
       <uri>model://aruco_3</uri>
       <name>landmark_3</name>
-      <pose>-1.41 1.41 0.40 0.0000 1.5708 2.3562</pose>
+      <pose>-0.99 0.99 0.30 0.0000 1.5708 2.3562</pose>
     </include>
 
     <include>
       <uri>model://aruco_4</uri>
       <name>landmark_4</name>
-      <pose>-2.00 0.00 0.40 0.0000 1.5708 3.1416</pose>
+      <pose>-1.40 0.00 0.30 0.0000 1.5708 3.1416</pose>
     </include>
 
     <include>
       <uri>model://aruco_5</uri>
       <name>landmark_5</name>
-      <pose>-1.41 -1.41 0.40 0.0000 1.5708 3.9270</pose>
+      <pose>-0.99 -0.99 0.30 0.0000 1.5708 3.9270</pose>
     </include>
 
     <include>
       <uri>model://aruco_6</uri>
       <name>landmark_6</name>
-      <pose>-0.00 -2.00 0.40 0.0000 1.5708 4.7124</pose>
+      <pose>0.00 -1.40 0.30 0.0000 1.5708 4.7124</pose>
     </include>
 
     <include>
       <uri>model://aruco_7</uri>
       <name>landmark_7</name>
-      <pose>1.41 -1.41 0.40 0.0000 1.5708 5.4978</pose>
+      <pose>0.99 -0.99 0.30 0.0000 1.5708 5.4978</pose>
     </include>
 
+    <!-- Ring 2: 2.8m radius, 8 markers -->
     <include>
       <uri>model://aruco_8</uri>
       <name>landmark_8</name>
-      <pose>4.00 0.00 0.40 0.0000 1.5708 0.0000</pose>
+      <pose>2.80 0.00 0.30 0.0000 1.5708 0.0000</pose>
     </include>
 
     <include>
       <uri>model://aruco_9</uri>
       <name>landmark_9</name>
-      <pose>2.83 2.83 0.40 0.0000 1.5708 0.7854</pose>
+      <pose>1.98 1.98 0.30 0.0000 1.5708 0.7854</pose>
     </include>
 
     <include>
       <uri>model://aruco_10</uri>
       <name>landmark_10</name>
-      <pose>0.00 4.00 0.40 0.0000 1.5708 1.5708</pose>
+      <pose>0.00 2.80 0.30 0.0000 1.5708 1.5708</pose>
     </include>
 
     <include>
       <uri>model://aruco_11</uri>
       <name>landmark_11</name>
-      <pose>-2.83 2.83 0.40 0.0000 1.5708 2.3562</pose>
+      <pose>-1.98 1.98 0.30 0.0000 1.5708 2.3562</pose>
     </include>
 
     <include>
       <uri>model://aruco_12</uri>
       <name>landmark_12</name>
-      <pose>-4.00 0.00 0.40 0.0000 1.5708 3.1416</pose>
+      <pose>-2.80 0.00 0.30 0.0000 1.5708 3.1416</pose>
     </include>
 
     <include>
       <uri>model://aruco_13</uri>
       <name>landmark_13</name>
-      <pose>-2.83 -2.83 0.40 0.0000 1.5708 3.9270</pose>
+      <pose>-1.98 -1.98 0.30 0.0000 1.5708 3.9270</pose>
     </include>
 
     <include>
       <uri>model://aruco_14</uri>
       <name>landmark_14</name>
-      <pose>-0.00 -4.00 0.40 0.0000 1.5708 4.7124</pose>
+      <pose>0.00 -2.80 0.30 0.0000 1.5708 4.7124</pose>
     </include>
 
     <include>
       <uri>model://aruco_15</uri>
       <name>landmark_15</name>
-      <pose>2.83 -2.83 0.40 0.0000 1.5708 5.4978</pose>
+      <pose>1.98 -1.98 0.30 0.0000 1.5708 5.4978</pose>
     </include>
 
+    <!-- Ring 3: 4.2m radius, 8 markers -->
     <include>
       <uri>model://aruco_16</uri>
       <name>landmark_16</name>
-      <pose>6.00 0.00 0.40 0.0000 1.5708 0.0000</pose>
+      <pose>4.20 0.00 0.30 0.0000 1.5708 0.0000</pose>
     </include>
 
     <include>
       <uri>model://aruco_17</uri>
       <name>landmark_17</name>
-      <pose>4.24 4.24 0.40 0.0000 1.5708 0.7854</pose>
+      <pose>2.97 2.97 0.30 0.0000 1.5708 0.7854</pose>
     </include>
 
     <include>
       <uri>model://aruco_18</uri>
       <name>landmark_18</name>
-      <pose>0.00 6.00 0.40 0.0000 1.5708 1.5708</pose>
+      <pose>0.00 4.20 0.30 0.0000 1.5708 1.5708</pose>
     </include>
 
     <include>
       <uri>model://aruco_19</uri>
       <name>landmark_19</name>
-      <pose>-4.24 4.24 0.40 0.0000 1.5708 2.3562</pose>
+      <pose>-2.97 2.97 0.30 0.0000 1.5708 2.3562</pose>
     </include>
 
     <include>
       <uri>model://aruco_20</uri>
       <name>landmark_20</name>
-      <pose>-6.00 0.00 0.40 0.0000 1.5708 3.1416</pose>
+      <pose>-4.20 0.00 0.30 0.0000 1.5708 3.1416</pose>
     </include>
 
     <include>
       <uri>model://aruco_21</uri>
       <name>landmark_21</name>
-      <pose>-4.24 -4.24 0.40 0.0000 1.5708 3.9270</pose>
+      <pose>-2.97 -2.97 0.30 0.0000 1.5708 3.9270</pose>
     </include>
 
     <include>
       <uri>model://aruco_22</uri>
       <name>landmark_22</name>
-      <pose>-0.00 -6.00 0.40 0.0000 1.5708 4.7124</pose>
+      <pose>0.00 -4.20 0.30 0.0000 1.5708 4.7124</pose>
     </include>
 
     <include>
       <uri>model://aruco_23</uri>
       <name>landmark_23</name>
-      <pose>4.24 -4.24 0.40 0.0000 1.5708 5.4978</pose>
+      <pose>2.97 -2.97 0.30 0.0000 1.5708 5.4978</pose>
     </include>
 
   </world>

@@ -139,10 +139,13 @@ class VisionNode(Node):
 
                 landmarks_msg.poses.append(pose)
 
-            # Log detection with marker IDs
+            # Collect all marker positions for logging
+            all_positions = [(int(np.mean(corners[i][0][:, 0])), int(np.mean(corners[i][0][:, 1]))) for i in range(len(ids))]
+
+            # Log detection with ALL marker IDs and positions
             self.get_logger().info(
                 f"ArUco DETECTED: {len(ids)} markers, IDs={ids.flatten().tolist()}, "
-                f"positions={(cx, cy)}",
+                f"positions={all_positions}",
                 throttle_duration_sec=1.0
             )
 
