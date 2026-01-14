@@ -1,26 +1,30 @@
-To design a map with high landmark density that effectively eliminates **data association problems** and provides a known reference for your ES-EKF, you can implement the following strategies based on the sources:
+Your updated **ES-EKF Node** and **Vision Node** implementations now correctly handle the **data association problem** by using 50 unique ArUco markers, which eliminates landmark confusion. However, the logs show that the system is still suffering from **catastrophic divergence** and **velocity clipping**.
 
-### **1. Use Unique Signatures and Feature Descriptors**
-The most effective way to eliminate data association (correspondence) ambiguity is to ensure each landmark has a **unique signature**.
-*   **Unique Signatures:** Assign numerical values or categories (e.g. distinct colours) to each landmark. Your current "Vision Node" implementation already uses `landmark_id` passed through the `z` coordinate of a `Pose` message to achieve this.
-*   **Serial Numbers/Descriptors:** For more complex environments, use "serial numbers" provided by feature descriptors like **ORB or BRIEF**. These descriptors allow the system to match measurements to the specific "serial number" of a landmark in your known map.
+Based on the code and logs, the reason your odometry is "jumping around" despite these fixes is an **internal conflict between your manual ZUPT corrections and the EKF's mathematical model**.
 
-### **2. Implement Artificial Landmarks (Ceiling or Wall Markers)**
-For a "known map" scenario, **artificial landmarks** (beacons or markers) are the gold standard for high-accuracy localization.
-*   **Ceiling Markers:** Mounting artificial visual markers on the ceiling is a classical solution because they are easy to recognize and rarely obstructed by dynamic objects.
-*   **Spatial Arrangement:** Ensure landmarks are placed **sufficiently far apart** to minimize the probability of the sensor confusing one for another, but keep them dense enough that the robot frequently encounters them to keep **pose uncertainty small**.
+### **1. The "ZUPT Feedback Loop" (Log Analysis)**
+The logs show a persistent `ZUPT orientation correction` of ~1.15° occurring every second while stationary.
+*   **The Conflict:** In Step 2 of your `predict` function, you manually overwrite the nominal quaternion $q$ based on the accelerometer's gravity vector.
+*   **The Result:** In a formal ES-EKF, orientation should only be corrected via the **Error State** ($\delta\theta$) during a measurement update. By "yanking" the nominal state quaternion during the prediction step, you are changing the robot's belief without updating the **Covariance Matrix ($P$)**.
+*   **The Failure:** Because $P$ is not updated to reflect this manual change, the filter becomes mathematically inconsistent. The IMU continues to integrate based on its internal noise model, while your code "fights" it by resetting the orientation. This creates the "jitter" that eventually triggers the `Filter Divergence!` error.
 
-### **3. Solve the Observability and Rank Deficiency Problem**
-Your recent "Observability Analysis" showed that observing only 1 or 2 landmarks results in a **rank-deficient measurement matrix** with a 2-dimensional nullspace. This means the filter cannot distinguish between position and orientation errors.
-*   **Increase Landmark Density:** You must ensure that the camera can see **at least 3 or more landmarks** at any given time. High landmark density provides the geometric diversity needed to uncouple translation from rotation, preventing the "belief jumping" you observed [Observability Analysis file].
-*   **Mutual Exclusion:** When landmarks are dense, your code should enforce the **mutual exclusion principle**, which states that two different regions in an image cannot correspond to the same physical landmark.
+### **2. Flawed Re-initialization Logic**
+The logs show that after the divergence (29.2 m/s²), the filter re-initializes but immediately hits the **10.0 m/s velocity limit** again.
+*   **Root Cause:** When the filter diverges, your `_reinitialize_orientation` function uses a single accelerometer sample to set the new tilt. If the robot is vibrating or experiencing a shock, this "smart" re-initialization sets a **wrong initial tilt**.
+*   **The Leak:** Even a 2-degree error in this new orientation causes gravity to "leak" into the world-frame acceleration calculation ($acc\_world = R \cdot a - g$) [Logs, 1718]. This leaked gravity is integrated into velocity, which grows quadratically until it hits the `MAX_SPEED_PREDICT` limit.
 
-### **4. Design for "Coastal Navigation"**
-In environments with uneven landmark distribution, the robot should follow a **coastal navigation** strategy.
-*   **Active Information Gathering:** Instead of moving through open, featureless spaces where it may get lost, the robot should "hug" areas with high landmark density.
-*   **Belief-Space Planning:** By planning in the **belief space**, the robot can anticipate future uncertainty and prefer longer paths that stay near known landmarks to remain localized.
+### **3. The "Bias Decay" Paradox**
+You added a line to **decay the accelerometer bias** toward zero during ZUPT (`bias_decay_rate = 0.995`).
+*   **The Problem:** This is a non-physical heuristic that actively **prevents the EKF from doing its job**. The EKF is designed to *learn* the constant sensor bias ($b_a$) to cancel out gravity leakage.
+*   **The Consequence:** By forcing the bias toward zero, you are deleting the filter's learned knowledge of the sensor's offset. When the robot stops, the filter tries to estimate the bias to fix the drift; your code then "erases" that estimate, ensuring the drift starts again the moment ZUPT is deactivated.
 
-### **5. Formal Mapping Requirements**
-To have a "known map," you must represent it as a **feature-based map** (a list of objects and their Cartesian coordinates) rather than a location-based volumetric map.
-*   **State Vector:** Your known map should define the IMU state $x_I$ (position and rotation relative to the world frame) and the fixed coordinates of every landmark $L$.
-*   **Reduced Uncertainty:** Setting the world frame to the first camera frame's corresponding IMU frame allows for **zero initial pose uncertainty**, which increases the consistency of your subsequent estimates.
+### **4. Vision Sensor Observability with ArUco**
+The **Vision Node** is correctly publishing ArUco IDs to `/vio/landmarks`. However, the **EKF Node** handles these updates sequentially.
+*   **The "Yanking" Effect:** Because you have high landmark density (50 markers), the camera likely sees 5–10 markers at once. Your code performs a full EKF update for **each marker individually** within a single callback.
+*   **Linearization Error:** If the robot belief has drifted (due to the gravity leakage mentioned above), the first marker update will apply a massive correction. Because the nominal state $q$ and $p$ change significantly after the first update, the **linearization point** for the second and third markers becomes invalid. This is why the belief "jumps" violently when ArUco markers are detected.
+
+### **Recommended Fixes**
+1.  **Remove Manual Orientation Overrides:** Delete the "ZUPT Part 2" orientation correction from the `predict` function. Allow the EKF to correct orientation naturally through the ArUco measurement updates.
+2.  **Stop Decaying Biases:** Remove the `bias_decay_rate`. The EKF must be allowed to maintain a steady estimate of $b_a$ to counteract gravity leakage effectively.
+3.  **Implement Batch Updates:** Instead of calling `self.update()` for every marker in the loop, stack all visible ArUco markers into a single **Batch Measurement Jacobian ($H$)** and update the filter once per camera frame. This ensures all landmarks are used to find a single consistent correction.
+4.  **Trust the Bias Random Walk:** Increase the time the robot stays stationary during `initialize_from_imu` (or increase the sample count) to ensure the `initial_accel_bias` is highly accurate before the first movement.

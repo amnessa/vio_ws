@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
+"""
+ArUco Vision Node for VIO EKF
+
+Detects ArUco markers (DICT_4X4_50) and publishes their pixel coordinates
+with unique IDs. This replaces color-based detection for robust data association.
+
+Based on recommendation2.md:
+- Unique ArUco IDs eliminate correspondence ambiguity
+- High marker density ensures 3+ landmarks visible for observability
+- Subpixel corner refinement improves measurement accuracy
+"""
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseArray, Pose
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+
 
 class VisionNode(Node):
     def __init__(self):
@@ -19,111 +31,89 @@ class VisionNode(Node):
             10)
 
         # Publisher for landmarks (u, v, id)
-        # Using PoseArray for simplicity:
-        # x = u (pixel), y = v (pixel), z = ID (1=Red, 2=Green)
+        # x = u (pixel), y = v (pixel), z = ArUco marker ID
         self.publisher_ = self.create_publisher(PoseArray, '/vio/landmarks', 10)
 
         self.bridge = CvBridge()
 
-        # Define HSV color ranges
-        # Red can wrap around 180, so we need two ranges
-        self.lower_red1 = np.array([0, 70, 50])
-        self.upper_red1 = np.array([10, 255, 255])
-        self.lower_red2 = np.array([170, 70, 50])
-        self.upper_red2 = np.array([180, 255, 255])
+        # ArUco Dictionary (Must match the generation script: DICT_4X4_50)
+        # Using OpenCV 4.5.x API
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.aruco_params = cv2.aruco.DetectorParameters_create()
 
-        # Green range (ID 2)
-        self.lower_green = np.array([40, 70, 50])
-        self.upper_green = np.array([80, 255, 255])
+        # Tune detection parameters for better multi-marker detection
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.adaptiveThreshWinSizeMin = 3
+        self.aruco_params.adaptiveThreshWinSizeMax = 23
+        self.aruco_params.adaptiveThreshWinSizeStep = 10
+        self.aruco_params.minMarkerPerimeterRate = 0.02  # Detect smaller markers
+        self.aruco_params.maxMarkerPerimeterRate = 4.0
+        self.aruco_params.polygonalApproxAccuracyRate = 0.03
+        self.aruco_params.minCornerDistanceRate = 0.05
+        self.aruco_params.minDistanceToBorder = 3
 
-        # Blue range (ID 3)
-        self.lower_blue = np.array([100, 70, 50])
-        self.upper_blue = np.array([130, 255, 255])
+        # Detection statistics
+        self.detection_count = 0
+        self.last_log_time = self.get_clock().now()
 
-        # Yellow range (ID 4)
-        self.lower_yellow = np.array([20, 70, 50])
-        self.upper_yellow = np.array([35, 255, 255])
-
-        # Cyan range (ID 5)
-        self.lower_cyan = np.array([80, 70, 50])
-        self.upper_cyan = np.array([100, 255, 255])
-
-        self.get_logger().info("Vision Node Started. Detecting 5 landmarks (Red, Green, Blue, Yellow, Cyan)...")
+        self.get_logger().info("ArUco Vision Node Started (DICT_4X4_50, 24 markers in circular pattern)")
 
     def image_callback(self, msg):
         try:
-            # Convert ROS Image to OpenCV Image
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f'CV Bridge error: {e}')
             return
 
-        # Convert to HSV color space
-        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        # Convert to grayscale for ArUco detection
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        # Create masks
-        mask_red1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
-        mask_red2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
-        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+        # Detect ArUco markers
+        corners, ids, rejected = cv2.aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.aruco_params)
 
-        mask_green = cv2.inRange(hsv, self.lower_green, self.upper_green)
-        mask_blue = cv2.inRange(hsv, self.lower_blue, self.upper_blue)
-        mask_yellow = cv2.inRange(hsv, self.lower_yellow, self.upper_yellow)
-        mask_cyan = cv2.inRange(hsv, self.lower_cyan, self.upper_cyan)
-
-        # Detect blobs
         landmarks_msg = PoseArray()
-        landmarks_msg.header = msg.header # Sync timestamps
+        landmarks_msg.header = msg.header
 
-        # Process Red (ID 1)
-        self.detect_and_add(mask_red, 1.0, landmarks_msg, cv_image, (0, 0, 255))
+        # Debug: log rejected candidates periodically
+        self.detection_count += 1
+        if self.detection_count % 50 == 1:  # Every 5 seconds at 10Hz
+            self.get_logger().info(
+                f"Image size: {cv_image.shape}, Detected: {len(ids) if ids is not None else 0}, "
+                f"Rejected candidates: {len(rejected)}"
+            )
 
-        # Process Green (ID 2)
-        self.detect_and_add(mask_green, 2.0, landmarks_msg, cv_image, (0, 255, 0))
+        if ids is not None:
+            for i in range(len(ids)):
+                # Get center of the marker (u, v) from corner average
+                c = corners[i][0]
+                cx = float(np.mean(c[:, 0]))
+                cy = float(np.mean(c[:, 1]))
+                marker_id = float(ids[i][0])
 
-        # Process Blue (ID 3)
-        self.detect_and_add(mask_blue, 3.0, landmarks_msg, cv_image, (255, 0, 0))
+                # Create Pose observation
+                pose = Pose()
+                pose.position.x = cx  # u pixel coordinate
+                pose.position.y = cy  # v pixel coordinate
+                pose.position.z = marker_id  # ArUco ID for data association
+                pose.orientation.w = 1.0
 
-        # Process Yellow (ID 4)
-        self.detect_and_add(mask_yellow, 4.0, landmarks_msg, cv_image, (0, 255, 255))
+                landmarks_msg.poses.append(pose)
 
-        # Process Cyan (ID 5)
-        self.detect_and_add(mask_cyan, 5.0, landmarks_msg, cv_image, (255, 255, 0))
+            # Log detection with marker IDs
+            self.get_logger().info(
+                f"ArUco DETECTED: {len(ids)} markers, IDs={ids.flatten().tolist()}, "
+                f"positions={(cx, cy)}",
+                throttle_duration_sec=1.0
+            )
 
-        # Publish detections
+            # Debug visualization (uncomment for debugging)
+            # cv2.aruco.drawDetectedMarkers(cv_image, corners, ids)
+            # cv2.imshow("ArUco View", cv_image)
+            # cv2.waitKey(1)
+
+        # Always publish (empty if no markers detected)
         self.publisher_.publish(landmarks_msg)
-
-        # Optional: Debug view (comment out if running headless without X11 forwarding)
-        # cv2.imshow("Debug View", cv_image)
-        # cv2.waitKey(1)
-
-    def detect_and_add(self, mask, landmark_id, msg_array, debug_img, color):
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            # Filter noise
-            if area > 500:
-                M = cv2.moments(contour)
-                if M['m00'] != 0:
-                    cx = int(M['m10'] / M['m00'])
-                    cy = int(M['m01'] / M['m00'])
-
-                    # Create Pose observation
-                    pose = Pose()
-                    pose.position.x = float(cx)
-                    pose.position.y = float(cy)
-                    pose.position.z = float(landmark_id)
-
-                    # We don't use orientation for point features
-                    pose.orientation.w = 1.0
-
-                    msg_array.poses.append(pose)
-
-                    # Draw on debug image
-                    cv2.circle(debug_img, (cx, cy), 5, (255, 255, 255), -1)
-                    cv2.drawContours(debug_img, [contour], 0, color, 2)
 
 def main(args=None):
     rclpy.init(args=args)
