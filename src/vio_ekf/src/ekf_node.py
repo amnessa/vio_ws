@@ -80,10 +80,12 @@ class EKFNode(Node):
 
         # ZUPT (Zero-Velocity Update) parameters
         # When gyro activity is low, robot is likely stationary
-        self.zupt_gyro_threshold = 0.02  # rad/s - below this, consider stationary
-        self.zupt_accel_threshold = 0.3   # m/s² - deviation from gravity
+        self.zupt_gyro_threshold = 0.03  # rad/s - below this, consider stationary
+        self.zupt_accel_threshold = 1.0   # m/s² - RELAXED: with orientation error, even stationary shows deviation
         self.zupt_window = []  # Rolling window of IMU samples
         self.zupt_window_size = 50  # ~250ms at 200Hz
+        self.zupt_gyro_only_counter = 0  # Counter for gyro-only stationary detection
+        self.zupt_gyro_only_threshold = 200  # 1 second at 200Hz - if gyro stable this long, definitely stationary
 
         # Outlier rejection settings
         self.mahalanobis_threshold = 8.0  # Relaxed threshold (chi-squared 99.5% for 2 DOF)
@@ -110,18 +112,29 @@ class EKFNode(Node):
             5.0: np.array([-3.0, -3.0, 0.5])   # Cyan
         }
 
-        # Calibration (Extrinsics: Base -> Camera)
-        # From TurtleBot3 Waffle Pi SDF: <pose>0.076 0.0 0.093 0 0 0</pose>
-        # CRITICAL: Previous values [0.064, -0.065, 0.094] were WRONG!
-        # The incorrect y=-0.065 offset caused landmark projection errors,
-        # leading to phantom velocity and position drift during rotation.
-        self.T_b_c = np.eye(4)
-        self.T_b_c[0:3, 3] = [0.076, 0.0, 0.093]  # Matches SDF camera_link pose
-        # Rotation: Body frame (X-forward) to Camera optical frame (Z-forward)
-        # Body: X=forward, Y=left, Z=up
-        # Optical: X=right, Y=down, Z=forward (into scene)
-        # Transform: optical_X = -body_Y, optical_Y = -body_Z, optical_Z = body_X
-        self.R_b_c = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]])
+        # Calibration (Extrinsics: Base -> Camera Optical Frame)
+        # From URDF chain:
+        #   base_link -> camera_link:     xyz="0.073 -0.011 0.084" rpy="0 0 0"
+        #   camera_link -> camera_rgb:    xyz="0.003 0.011 0.009" rpy="0 0 0"
+        #   camera_rgb -> optical:        xyz="0 0 0" rpy="-1.57 0 -1.57"
+        # Total translation: [0.073+0.003, -0.011+0.011, 0.084+0.009] = [0.076, 0.0, 0.093]
+        self.t_b_c = np.array([0.076, 0.0, 0.093])
+
+        # Rotation from body frame to camera optical frame
+        # Body frame (ROS): X=forward, Y=left, Z=up
+        # Optical frame (OpenCV): X=right, Y=down, Z=forward (depth)
+        #
+        # Verified transformation:
+        #   Body X [1,0,0] -> Camera [0,0,1] (depth)
+        #   Body Y [0,1,0] -> Camera [-1,0,0] (negative right = left)
+        #   Body Z [0,0,1] -> Camera [0,-1,0] (negative down = up)
+        #
+        # This gives R_b_c such that p_camera = R_b_c @ p_body
+        self.R_b_c = np.array([
+            [0, -1, 0],   # Camera X = -Body Y
+            [0, 0, -1],   # Camera Y = -Body Z
+            [1, 0, 0]     # Camera Z = Body X (depth = forward)
+        ], dtype=np.float64)
 
         # Camera Intrinsics (will be updated callback)
         self.K = np.array([[530.0, 0, 320.0], [0, 530.0, 240.0], [0, 0, 1]])
@@ -415,36 +428,101 @@ class EKFNode(Node):
         # ===================================================================
         # Per recommendation2.md: Apply ZUPT when robot is stationary to prevent
         # gravity leakage from accumulating during idle periods.
-        # Detect stationary state from low gyro and consistent gravity reading.
+        # ALSO correct orientation from gravity to fix the ROOT CAUSE of leakage.
 
         gyro_norm = np.linalg.norm(w_corrected)
         accel_deviation = abs(np.linalg.norm(a_corrected) - self.gravity_magnitude)
 
         # Add to rolling window
-        self.zupt_window.append({'gyro': gyro_norm, 'accel_dev': accel_deviation})
+        self.zupt_window.append({'gyro': gyro_norm, 'accel_dev': accel_deviation, 'accel': a_corrected.copy()})
         if len(self.zupt_window) > self.zupt_window_size:
             self.zupt_window.pop(0)
 
-        # Check if stationary (all samples in window below threshold)
+        # --- Gyro-only stationary detection ---
+        # If gyro is stable for extended period, robot is definitely stationary
+        # even if accel shows deviation (which could be from orientation error)
+        if gyro_norm < self.zupt_gyro_threshold:
+            self.zupt_gyro_only_counter += 1
+        else:
+            self.zupt_gyro_only_counter = 0
+
+        # Check if stationary (two conditions: normal ZUPT OR gyro-only)
         is_stationary = False
+        gyro_only_stationary = self.zupt_gyro_only_counter >= self.zupt_gyro_only_threshold
+
         if len(self.zupt_window) >= self.zupt_window_size:
             avg_gyro = np.mean([s['gyro'] for s in self.zupt_window])
             avg_accel_dev = np.mean([s['accel_dev'] for s in self.zupt_window])
 
-            if avg_gyro < self.zupt_gyro_threshold and avg_accel_dev < self.zupt_accel_threshold:
+            normal_stationary = avg_gyro < self.zupt_gyro_threshold and avg_accel_dev < self.zupt_accel_threshold
+
+            if normal_stationary or gyro_only_stationary:
                 is_stationary = True
-                # Apply ZUPT: Force velocity to zero with high confidence
+
+                # --- ZUPT Part 1: Zero Velocity ---
                 if np.linalg.norm(v[:2]) > 0.05:  # Only log if velocity was significant
+                    mode = "gyro-only" if gyro_only_stationary and not normal_stationary else "normal"
                     self.get_logger().info(
-                        f"ZUPT: Stationary detected (gyro={avg_gyro:.3f}, accel_dev={avg_accel_dev:.3f}). "
+                        f"ZUPT [{mode}]: Stationary (gyro={avg_gyro:.3f}). "
                         f"Resetting velocity from [{v[0]:.2f}, {v[1]:.2f}] to [0, 0]",
                         throttle_duration_sec=1.0
                     )
-                # Reset velocity to zero
                 self.x[3:6] = 0.0
-                # Collapse velocity covariance (high confidence in zero velocity)
-                self.P[3:6, 3:6] = np.eye(3) * 0.001  # Very low uncertainty
-                v = self.x[3:6]  # Update local variable
+                self.P[3:6, 3:6] = np.eye(3) * 0.01  # Moderate uncertainty
+                v = self.x[3:6]
+
+                # --- ZUPT Part 2: Correct Roll/Pitch from Gravity (AGGRESSIVE) ---
+                # Per analysis: ZUPT must fix orientation error to prevent gravity leakage.
+                # Without fixing orientation, filter compensates with bias, which breaks on turns.
+                avg_accel = np.mean([s['accel'] for s in self.zupt_window], axis=0)
+                accel_norm = np.linalg.norm(avg_accel)
+
+                if accel_norm > 0.1:
+                    # Gravity direction in body frame (normalized)
+                    g_body_measured = avg_accel / accel_norm
+                    # Expected gravity in body frame based on current orientation
+                    g_world = np.array([0, 0, 1])  # Gravity points up in world frame
+                    g_body_expected = R_wb.T @ g_world
+
+                    # Small angle correction using cross product
+                    # error = g_measured × g_expected (rotation axis to align them)
+                    error = np.cross(g_body_measured, g_body_expected)
+                    error_norm = np.linalg.norm(error)
+
+                    # Apply correction with higher gain when error is large
+                    # Use adaptive gain: small errors get small corrections (avoid jitter),
+                    # large errors get aggressive corrections (fast convergence)
+                    if error_norm > 0.001:  # Lower threshold - always correct
+                        # Adaptive gain: 0.2 for large errors, 0.05 for small
+                        correction_gain = 0.2 if error_norm > 0.05 else 0.1
+
+                        dtheta = correction_gain * error
+
+                        # Update quaternion
+                        dq_rot = R.from_rotvec(dtheta)
+                        q_curr_obj = R.from_quat([q[1], q[2], q[3], q[0]])  # [x,y,z,w]
+                        q_new_obj = q_curr_obj * dq_rot
+                        q_new = q_new_obj.as_quat()  # [x,y,z,w]
+                        self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
+
+                        # Update R_wb for subsequent calculations
+                        rot = R.from_quat([self.x[7], self.x[8], self.x[9], self.x[6]])
+                        R_wb = rot.as_matrix()
+
+                        # Log significant corrections
+                        if error_norm > 0.02:
+                            self.get_logger().info(
+                                f"ZUPT orientation correction: {np.degrees(error_norm):.2f}°",
+                                throttle_duration_sec=1.0
+                            )
+
+                # --- ZUPT Part 3: Decay Accelerometer Bias Toward Zero ---
+                # When stationary with correct orientation, the only "phantom" acceleration
+                # should come from true sensor bias. But if orientation was wrong and we
+                # just corrected it, the previously estimated bias was "fake" (compensating
+                # for orientation error, not real bias). Slowly decay it.
+                bias_decay_rate = 0.995  # Decay ~1% per 200Hz sample = ~86% per second
+                self.x[10:13] = self.x[10:13] * bias_decay_rate
 
         # ===================================================================
         # STEP 1: Nominal State Propagation (Non-linear Kinematics)
@@ -753,23 +831,12 @@ class EKFNode(Node):
         # p_b = R_wb^T * (p_lm - p_w)
         p_b = R_wb.T @ (lm_pos_world - p_w)
 
-        # Transform Body -> Camera
-        # Assuming fixed offset T_bc
-        # p_c = R_bc.T * (p_b - t_bc)  <-- Wait, usually p_c = R_bc^T * p_b - R_bc^T*t_bc
-        # Let's use standard homogeneous transform
-        # T_wc = T_wb * T_bc
-        # p_c = T_wc^-1 * p_w_lm
+        # Transform Body -> Camera Optical Frame
+        # p_c = R_b_c @ (p_b - t_b_c)
+        # This is correct: first translate to camera origin, then rotate to optical frame
+        p_c = self.R_b_c @ (p_b - self.t_b_c)
 
-        # Simplified: We defined R_b_c manually in init
-        # Correct Body->Camera (Rotation only for now, ignoring small translation for Jacobian approx)
-        # p_c = self.R_b_c @ p_b
-
-        # Full Transform:
-        t_bc = self.T_b_c[0:3, 3]
-        # Since R_b_c provided matches Optical frame
-        p_c = self.R_b_c @ (p_b - t_bc)
-
-        # Check if behind camera
+        # Check if behind camera (Z in optical frame is depth)
         if p_c[2] < 0.1: return
 
         # Project to pixels

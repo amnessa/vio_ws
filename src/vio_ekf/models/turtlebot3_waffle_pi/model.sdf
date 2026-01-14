@@ -418,7 +418,7 @@
         <update_rate>10</update_rate>
         <topic>/camera</topic>
         <camera name="picam">
-          <horizontal_fov>1.085595</horizontal_fov>
+          <horizontal_fov>2.00</horizontal_fov> <!-- modified from 1.085595 -->
           <image>
               <width>640</width>
               <height>480</height>
