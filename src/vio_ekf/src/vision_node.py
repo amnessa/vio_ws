@@ -41,35 +41,44 @@ class VisionNode(Node):
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
 
-        # Aggressive detection parameters for multiple markers at various distances
-        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # === AGGRESSIVE DETECTION FOR MULTIPLE MARKERS ===
+        # ES-EKF requires 3+ landmarks visible at all times for observability
 
-        # Adaptive thresholding - wider range for varying lighting
+        # Subpixel corner refinement for better accuracy
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementWinSize = 5
+        self.aruco_params.cornerRefinementMaxIterations = 50
+        self.aruco_params.cornerRefinementMinAccuracy = 0.01
+
+        # Adaptive thresholding - wider range for varying lighting/distances
         self.aruco_params.adaptiveThreshWinSizeMin = 3
-        self.aruco_params.adaptiveThreshWinSizeMax = 53  # Larger window for distant markers
-        self.aruco_params.adaptiveThreshWinSizeStep = 4  # More steps = better detection
+        self.aruco_params.adaptiveThreshWinSizeMax = 153  # Much larger for distant markers
+        self.aruco_params.adaptiveThreshWinSizeStep = 10
         self.aruco_params.adaptiveThreshConstant = 7
 
-        # Marker size detection - very permissive
-        self.aruco_params.minMarkerPerimeterRate = 0.01  # Detect very small markers
-        self.aruco_params.maxMarkerPerimeterRate = 4.0
+        # Marker size detection - VERY permissive to catch all sizes
+        self.aruco_params.minMarkerPerimeterRate = 0.005  # Detect tiny markers
+        self.aruco_params.maxMarkerPerimeterRate = 8.0    # And very large ones
 
-        # Relaxed corner/contour detection
-        self.aruco_params.polygonalApproxAccuracyRate = 0.05  # More tolerant
-        self.aruco_params.minCornerDistanceRate = 0.01  # Allow close corners
-        self.aruco_params.minDistanceToBorder = 1  # Detect markers at edge
-        self.aruco_params.minMarkerDistanceRate = 0.01  # Allow close markers
+        # Relaxed contour detection
+        self.aruco_params.polygonalApproxAccuracyRate = 0.08  # More tolerant of imperfect squares
+        self.aruco_params.minCornerDistanceRate = 0.01
+        self.aruco_params.minDistanceToBorder = 1
+        self.aruco_params.minMarkerDistanceRate = 0.005  # Allow very close markers
 
-        # Bit extraction - more tolerant for angled/distant markers
-        self.aruco_params.perspectiveRemovePixelPerCell = 8
-        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.2
-        self.aruco_params.maxErroneousBitsInBorderRate = 0.5  # More tolerant
-        self.aruco_params.errorCorrectionRate = 0.6  # Allow more error correction
+        # Bit extraction - CRITICAL for angled/distant markers
+        self.aruco_params.perspectiveRemovePixelPerCell = 4  # Lower = more tolerant
+        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.3  # Larger margin
+        self.aruco_params.maxErroneousBitsInBorderRate = 0.8  # Very tolerant of border issues
+        self.aruco_params.errorCorrectionRate = 1.0  # Maximum error correction
 
         # Detection statistics
         self.detection_count = 0
         self.last_log_time = self.get_clock().now()
         self.debug_save_counter = 0
+
+        # CLAHE for contrast enhancement (helps with washed-out simulation textures)
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
         self.get_logger().info("ArUco Vision Node Started (DICT_4X4_50, 24 markers in circular pattern)")
 
@@ -82,6 +91,9 @@ class VisionNode(Node):
 
         # Convert to grayscale for ArUco detection
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+
+        # Apply CLAHE to enhance contrast (simulation textures often have poor contrast)
+        gray = self.clahe.apply(gray)
 
         # Detect ArUco markers
         corners, ids, rejected = cv2.aruco.detectMarkers(

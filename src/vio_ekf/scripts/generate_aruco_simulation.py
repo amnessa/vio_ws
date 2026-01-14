@@ -42,8 +42,9 @@ def create_model_files(marker_id):
     # Each marker_id produces a UNIQUE pattern
     img = np.zeros((200, 200), dtype=np.uint8)
     img = aruco.drawMarker(aruco_dict, marker_id, 200, img)
-    # Add white border (crucial for detection)
-    img = cv2.copyMakeBorder(img, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+    # Add THICK white border (crucial for detection at angles/distances)
+    # The border should be at least 1 cell width - for 4x4 markers that's ~25% of marker size
+    img = cv2.copyMakeBorder(img, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=255)
     # Use unique filename to avoid Ignition texture cache issues
     marker_filename = f"marker_{marker_id}.png"
     marker_path = os.path.join(model_dir, marker_filename)
@@ -64,6 +65,8 @@ def create_model_files(marker_id):
     # Generate the model.sdf anyway, but we'll embed markers directly in world file.
     abs_marker_path = os.path.abspath(marker_path)
 
+    # Use UNLIT material to avoid lighting affecting marker contrast
+    # This is critical for ArUco detection which needs high black/white contrast
     with open(os.path.join(model_dir, "model.sdf"), "w") as f:
         f.write(f"""<?xml version="1.0" ?>
 <sdf version="1.6">
@@ -79,11 +82,17 @@ def create_model_files(marker_id):
         <material>
           <ambient>1 1 1 1</ambient>
           <diffuse>1 1 1 1</diffuse>
+          <emissive>0.3 0.3 0.3 1</emissive>
           <pbr>
             <metal>
               <albedo_map>{abs_marker_path}</albedo_map>
+              <metalness>0.0</metalness>
+              <roughness>1.0</roughness>
             </metal>
           </pbr>
+        </material>
+      </visual>
+    </link>
   </model>
 </sdf>""")
 
