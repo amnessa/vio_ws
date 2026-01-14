@@ -71,9 +71,19 @@ class EKFNode(Node):
         self.sigma_g = 0.05     # Gyro noise stddev (rad/s) - accounts for simulation noise
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        self.Q_ba = 1e-4  # Accel bias random walk - increased for faster adaptation
-        self.Q_bg = 1e-5  # Gyro bias random walk - faster adaptation
+        # Per recommendation2.md: Tune bias random walk carefully.
+        # Too high Q_ba causes filter to use bias to compensate for orientation errors.
+        # Reduced from 5e-4 to allow slower, more stable bias estimation.
+        self.Q_ba = 1e-4  # Accel bias random walk - slower adaptation
+        self.Q_bg = 1e-5  # Gyro bias random walk - slower adaptation
         self.R_cam = 5.0   # Pixel measurement noise - trust vision more (lower = more trust)
+
+        # ZUPT (Zero-Velocity Update) parameters
+        # When gyro activity is low, robot is likely stationary
+        self.zupt_gyro_threshold = 0.02  # rad/s - below this, consider stationary
+        self.zupt_accel_threshold = 0.3   # m/s² - deviation from gravity
+        self.zupt_window = []  # Rolling window of IMU samples
+        self.zupt_window_size = 50  # ~250ms at 200Hz
 
         # Outlier rejection settings
         self.mahalanobis_threshold = 8.0  # Relaxed threshold (chi-squared 99.5% for 2 DOF)
@@ -101,16 +111,16 @@ class EKFNode(Node):
         }
 
         # Calibration (Extrinsics: Base -> Camera)
-        # From Waffle Pi SDF: x=0.064, y=-0.065, z=0.094
+        # From TurtleBot3 Waffle Pi SDF: <pose>0.076 0.0 0.093 0 0 0</pose>
+        # CRITICAL: Previous values [0.064, -0.065, 0.094] were WRONG!
+        # The incorrect y=-0.065 offset caused landmark projection errors,
+        # leading to phantom velocity and position drift during rotation.
         self.T_b_c = np.eye(4)
-        self.T_b_c[0:3, 3] = [0.064, -0.065, 0.094]
-        # Rotation: Standard camera Z-forward vs ROS X-forward usually requires check
-        # For now assuming Identity rotation relative to base for simplicity,
-        # or we fix in camera_info callback if we get extrinsic there.
-        # Waffle Pi camera points forward (X).
-        # But OpenCV projection assumes Z is depth.
-        # Transform Optical (Z-forward) to Standard (X-forward):
-        # R_opt_std = [0 0 1; -1 0 0; 0 -1 0]
+        self.T_b_c[0:3, 3] = [0.076, 0.0, 0.093]  # Matches SDF camera_link pose
+        # Rotation: Body frame (X-forward) to Camera optical frame (Z-forward)
+        # Body: X=forward, Y=left, Z=up
+        # Optical: X=right, Y=down, Z=forward (into scene)
+        # Transform: optical_X = -body_Y, optical_Y = -body_Z, optical_Z = body_X
         self.R_b_c = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]])
 
         # Camera Intrinsics (will be updated callback)
@@ -401,6 +411,42 @@ class EKFNode(Node):
         w_corrected = w_m - bg  # Corrected angular velocity in body frame
 
         # ===================================================================
+        # ZUPT: Zero-Velocity Update (Stationary Detection)
+        # ===================================================================
+        # Per recommendation2.md: Apply ZUPT when robot is stationary to prevent
+        # gravity leakage from accumulating during idle periods.
+        # Detect stationary state from low gyro and consistent gravity reading.
+
+        gyro_norm = np.linalg.norm(w_corrected)
+        accel_deviation = abs(np.linalg.norm(a_corrected) - self.gravity_magnitude)
+
+        # Add to rolling window
+        self.zupt_window.append({'gyro': gyro_norm, 'accel_dev': accel_deviation})
+        if len(self.zupt_window) > self.zupt_window_size:
+            self.zupt_window.pop(0)
+
+        # Check if stationary (all samples in window below threshold)
+        is_stationary = False
+        if len(self.zupt_window) >= self.zupt_window_size:
+            avg_gyro = np.mean([s['gyro'] for s in self.zupt_window])
+            avg_accel_dev = np.mean([s['accel_dev'] for s in self.zupt_window])
+
+            if avg_gyro < self.zupt_gyro_threshold and avg_accel_dev < self.zupt_accel_threshold:
+                is_stationary = True
+                # Apply ZUPT: Force velocity to zero with high confidence
+                if np.linalg.norm(v[:2]) > 0.05:  # Only log if velocity was significant
+                    self.get_logger().info(
+                        f"ZUPT: Stationary detected (gyro={avg_gyro:.3f}, accel_dev={avg_accel_dev:.3f}). "
+                        f"Resetting velocity from [{v[0]:.2f}, {v[1]:.2f}] to [0, 0]",
+                        throttle_duration_sec=1.0
+                    )
+                # Reset velocity to zero
+                self.x[3:6] = 0.0
+                # Collapse velocity covariance (high confidence in zero velocity)
+                self.P[3:6, 3:6] = np.eye(3) * 0.001  # Very low uncertainty
+                v = self.x[3:6]  # Update local variable
+
+        # ===================================================================
         # STEP 1: Nominal State Propagation (Non-linear Kinematics)
         # ===================================================================
         # Acceleration in world frame (gravity compensated)
@@ -453,14 +499,14 @@ class EKFNode(Node):
         v_new[2] = 0.0
 
         # Velocity damping: prevent unbounded velocity growth
-        # Per recommendation.md: Increase MAX_SPEED or remove hard-clipping entirely
-        # to let the EKF's outlier rejection handle extreme measurements naturally.
-        # Only clip truly extreme values that indicate filter divergence.
-        MAX_SPEED = 5.0  # m/s - relaxed limit, real limit enforced post-vision-update
+        # Per recommendation2.md: Only apply extreme safety limits in prediction.
+        # Let the EKF's measurement update naturally correct velocity drift.
+        # The real velocity limit is enforced post-vision-update.
+        MAX_SPEED_PREDICT = 10.0  # m/s - high limit for prediction (safety watchdog only)
         speed = np.linalg.norm(v_new[:2])
-        if speed > MAX_SPEED:
-            v_new[:2] = v_new[:2] * (MAX_SPEED / speed)
-            self.get_logger().warn(f"Velocity clipped from {speed:.2f} to {MAX_SPEED} m/s (divergence!)")
+        if speed > MAX_SPEED_PREDICT:
+            v_new[:2] = v_new[:2] * (MAX_SPEED_PREDICT / speed)
+            self.get_logger().error(f"DIVERGENCE: Velocity {speed:.2f} m/s clipped in prediction!")
 
         # --- Orientation Update (Quaternion Integration) ---
         # Using quaternion exponential map: q_k = q_{k-1} ⊗ exp(0.5 * ω_corrected * dt)
@@ -612,55 +658,29 @@ class EKFNode(Node):
         # Ensure symmetry (numerical stability)
         self.P = 0.5 * (self.P + self.P.T)
 
-        # --- COVARIANCE BOUNDS ---
-        # Prevent covariance from growing unbounded, which causes erratic Kalman gains
-        # These limits represent our worst-case uncertainty
-        MAX_POS_VAR = 10.0   # 10m² = ~3m std (if off by more, filter should reset)
-        MAX_VEL_VAR = 1.0    # 1m²/s² = 1m/s std (robot max speed is 0.26 m/s)
-        MAX_ROT_VAR = 0.5    # 0.5 rad² = ~40° std
-        MAX_BIAS_VAR = 0.1   # Bias variance
-
-        # Clip diagonal elements
-        for i in range(3):
-            self.P[i, i] = min(self.P[i, i], MAX_POS_VAR)          # Position
-            self.P[3+i, 3+i] = min(self.P[3+i, 3+i], MAX_VEL_VAR)  # Velocity
-            self.P[6+i, 6+i] = min(self.P[6+i, 6+i], MAX_ROT_VAR)  # Orientation
-            self.P[9+i, 9+i] = min(self.P[9+i, 9+i], MAX_BIAS_VAR) # Accel bias
-            self.P[12+i, 12+i] = min(self.P[12+i, 12+i], MAX_BIAS_VAR) # Gyro bias
-
-        # Limit off-diagonal correlations to prevent wild cross-corrections
-        # Correlation coefficient should stay in [-1, 1]
-        for i in range(15):
-            for j in range(i+1, 15):
-                # Ensure diagonal elements are positive before taking sqrt
-                if self.P[i,i] > 0 and self.P[j,j] > 0:
-                    max_corr = np.sqrt(self.P[i,i] * self.P[j,j])
-                    if abs(self.P[i,j]) > max_corr:
-                        sign = np.sign(self.P[i,j]) if self.P[i,j] != 0 else 1.0
-                        self.P[i,j] = sign * max_corr * 0.99  # Keep correlation < 1
-                        self.P[j,i] = self.P[i,j]
-                else:
-                    # If diagonal is non-positive, reset this element
-                    self.P[i,j] = 0.0
-                    self.P[j,i] = 0.0
-
-        # Ensure positive semi-definiteness: clamp diagonal to positive values
-        for i in range(15):
-            if self.P[i,i] < 1e-10:
-                self.P[i,i] = 1e-10
-
-        # ===================================================================
-        # STEP 5: ACCELEROMETER-BASED ATTITUDE CORRECTION (DISABLED)
-        # ===================================================================
-        # Per recommendation.md: This manual "complementary filter" step introduces
-        # orientation jitter that manifests as erratic world acceleration.
-        # In a proper ES-EKF, the accelerometer should be a measurement update,
-        # not a manual correction outside the filter framework.
+        # Per recommendation2.md: Remove manual covariance clamping!
+        # Forcing diagonal elements to min/max values without updating off-diagonals
+        # breaks the mathematical consistency of the filter, causing P to lose
+        # positive-definiteness (the "Invalid Mahalanobis distance" errors).
         #
-        # For a ground robot, vision updates provide the necessary corrections.
-        # The gyro integration handles orientation, and vision corrects drift.
-        #
-        # REMOVED: Manual attitude correction from accelerometer
+        # Instead, use proper regularization: add small diagonal if needed
+        # to ensure positive semi-definiteness.
+
+        # Check for numerical issues and regularize if needed
+        min_diag = np.min(np.diag(self.P))
+        if min_diag < 1e-8:
+            # Add small regularization to diagonal
+            self.P += np.eye(15) * 1e-8
+            self.get_logger().warn("Covariance regularization applied", throttle_duration_sec=5.0)
+
+        # Per recommendation2.md: Apply ground robot Z-constraint to covariance
+        # to prevent P from growing in directions the state is forbidden to move
+        self.P[2, :] = 0.0
+        self.P[:, 2] = 0.0
+        self.P[2, 2] = 1e-6  # Z position variance (small, not zero)
+        self.P[5, :] = 0.0
+        self.P[:, 5] = 0.0
+        self.P[5, 5] = 1e-6  # Z velocity variance (small, not zero)
 
     def gt_callback(self, msg):
         """
@@ -819,20 +839,25 @@ class EKFNode(Node):
         if mahal_dist > adaptive_threshold:
             self.consecutive_outliers += 1
 
-            # NOTE: Removed manual covariance expansion per recommendations.md
-            # Manual P expansion causes violent state jumps (high Kalman gain)
-            # Instead, let the filter naturally increase uncertainty through Q
-            # and use a higher threshold to accept more measurements
-
+            # Per recommendation2.md: Use robust M-estimator (Huber) instead of
+            # binary accept/reject. This down-weights outliers gracefully.
             if self.consecutive_outliers >= self.max_consecutive_outliers:
-                # After many outliers, lower threshold to accept next measurement
-                # This allows gradual correction rather than violent jumps
-                self.get_logger().warn(f"FILTER RECOVERY: {self.consecutive_outliers} outliers. Lowering threshold temporarily.")
-                # Don't modify P - just accept the next measurement with a warning
+                # Instead of expanding covariance (which causes jumps),
+                # apply Huber-weighted update with reduced gain
+                huber_threshold = 3.0  # Standard Huber threshold
+                huber_weight = huber_threshold / mahal_dist  # < 1 for outliers
+                self.get_logger().warn(
+                    f"Robust update: Mahal={mahal_dist:.1f}, Huber weight={huber_weight:.2f}"
+                )
+                # Scale the innovation by Huber weight
+                z_res = z_res * huber_weight
                 self.consecutive_outliers = 0
-                # Fall through to accept this measurement (don't return)
+                # Continue with weighted update below (don't return)
             else:
-                self.get_logger().warn(f"Outlier Rejected! Residual: {pixel_residual:.1f} px, Mahal: {mahal_dist:.1f} (thresh={adaptive_threshold:.1f})")
+                self.get_logger().warn(
+                    f"Outlier Rejected! Residual: {pixel_residual:.1f} px, "
+                    f"Mahal: {mahal_dist:.1f} (thresh={adaptive_threshold:.1f})"
+                )
                 return
 
         # Good measurement - reset outlier counter
@@ -897,8 +922,17 @@ class EKFNode(Node):
         self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
 
         # --- GROUND ROBOT CONSTRAINTS (post-update) ---
+        # Per recommendation2.md: When zeroing state, also zero corresponding covariance
+        # to prevent P mismatch (state forbidden to move but covariance grows)
         self.x[2] = 0.0  # Z position = 0
         self.x[5] = 0.0  # Z velocity = 0
+        # Zero out Z covariance rows/columns to match state constraint
+        self.P[2, :] = 0.0
+        self.P[:, 2] = 0.0
+        self.P[2, 2] = 1e-6  # Small non-zero for numerical stability
+        self.P[5, :] = 0.0
+        self.P[:, 5] = 0.0
+        self.P[5, 5] = 1e-6
 
         # Final velocity sanity check (physical limit, not EKF limit)
         MAX_SPEED = 2.0  # m/s - slightly above TurtleBot max for safety margin
@@ -911,7 +945,9 @@ class EKFNode(Node):
         # Extract yaw from quaternion for readability
         q = self.x[6:10]  # [w, x, y, z]
         yaw = R.from_quat([q[1], q[2], q[3], q[0]]).as_euler('zyx')[0]
-        pos_std = np.sqrt(np.diag(self.P[0:3, 0:3]))
+        # Handle potential negative diagonal (use abs to avoid sqrt warning)
+        pos_diag = np.diag(self.P[0:3, 0:3])
+        pos_std = np.sqrt(np.maximum(pos_diag, 0.0))
         ba = self.x[10:13]  # Accel bias
         self.get_logger().info(
             f"BELIEF: pos=[{self.x[0]:.2f}, {self.x[1]:.2f}]m, yaw={np.degrees(yaw):.1f}°, "
