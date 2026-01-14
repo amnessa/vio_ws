@@ -60,8 +60,8 @@ def create_model_files(marker_id):
   <description>ArUco Marker {marker_id}</description>
 </model>""")
 
-    # model.sdf - Use absolute path for texture (Ignition resolves this reliably)
-    # Get absolute path to the marker image
+    # For software rendering (libEGL fallback), textures may not load properly.
+    # Generate the model.sdf anyway, but we'll embed markers directly in world file.
     abs_marker_path = os.path.abspath(marker_path)
 
     with open(os.path.join(model_dir, "model.sdf"), "w") as f:
@@ -84,9 +84,6 @@ def create_model_files(marker_id):
               <albedo_map>{abs_marker_path}</albedo_map>
             </metal>
           </pbr>
-        </material>
-      </visual>
-    </link>
   </model>
 </sdf>""")
 

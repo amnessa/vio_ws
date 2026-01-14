@@ -41,20 +41,35 @@ class VisionNode(Node):
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
 
-        # Tune detection parameters for better multi-marker detection
+        # Aggressive detection parameters for multiple markers at various distances
         self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+
+        # Adaptive thresholding - wider range for varying lighting
         self.aruco_params.adaptiveThreshWinSizeMin = 3
-        self.aruco_params.adaptiveThreshWinSizeMax = 23
-        self.aruco_params.adaptiveThreshWinSizeStep = 10
-        self.aruco_params.minMarkerPerimeterRate = 0.02  # Detect smaller markers
+        self.aruco_params.adaptiveThreshWinSizeMax = 53  # Larger window for distant markers
+        self.aruco_params.adaptiveThreshWinSizeStep = 4  # More steps = better detection
+        self.aruco_params.adaptiveThreshConstant = 7
+
+        # Marker size detection - very permissive
+        self.aruco_params.minMarkerPerimeterRate = 0.01  # Detect very small markers
         self.aruco_params.maxMarkerPerimeterRate = 4.0
-        self.aruco_params.polygonalApproxAccuracyRate = 0.03
-        self.aruco_params.minCornerDistanceRate = 0.05
-        self.aruco_params.minDistanceToBorder = 3
+
+        # Relaxed corner/contour detection
+        self.aruco_params.polygonalApproxAccuracyRate = 0.05  # More tolerant
+        self.aruco_params.minCornerDistanceRate = 0.01  # Allow close corners
+        self.aruco_params.minDistanceToBorder = 1  # Detect markers at edge
+        self.aruco_params.minMarkerDistanceRate = 0.01  # Allow close markers
+
+        # Bit extraction - more tolerant for angled/distant markers
+        self.aruco_params.perspectiveRemovePixelPerCell = 8
+        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.2
+        self.aruco_params.maxErroneousBitsInBorderRate = 0.5  # More tolerant
+        self.aruco_params.errorCorrectionRate = 0.6  # Allow more error correction
 
         # Detection statistics
         self.detection_count = 0
         self.last_log_time = self.get_clock().now()
+        self.debug_save_counter = 0
 
         self.get_logger().info("ArUco Vision Node Started (DICT_4X4_50, 24 markers in circular pattern)")
 
@@ -75,13 +90,25 @@ class VisionNode(Node):
         landmarks_msg = PoseArray()
         landmarks_msg.header = msg.header
 
-        # Debug: log rejected candidates periodically
+        # Debug: save image with detections every 100 frames
         self.detection_count += 1
-        if self.detection_count % 50 == 1:  # Every 5 seconds at 10Hz
+        if self.detection_count % 100 == 1:
+            debug_img = cv_image.copy()
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(debug_img, corners, ids)
+            # Also draw rejected candidates in red
+            if len(rejected) > 0:
+                for rej in rejected:
+                    pts = rej[0].astype(np.int32)
+                    cv2.polylines(debug_img, [pts], True, (0, 0, 255), 2)
+
+            save_path = f"/tmp/aruco_debug_{self.debug_save_counter}.png"
+            cv2.imwrite(save_path, debug_img)
             self.get_logger().info(
-                f"Image size: {cv_image.shape}, Detected: {len(ids) if ids is not None else 0}, "
-                f"Rejected candidates: {len(rejected)}"
+                f"DEBUG: Saved {save_path} - Detected: {len(ids) if ids is not None else 0}, "
+                f"Rejected: {len(rejected)}"
             )
+            self.debug_save_counter += 1
 
         if ids is not None:
             for i in range(len(ids)):

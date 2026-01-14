@@ -1,208 +1,1205 @@
 <?xml version="1.0" ?>
 <sdf version="1.8">
-  <world name="vio_world">
+  <world name="landmarks_world">
+    <!-- Physics -->
     <physics name="1ms" type="ignored">
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
     </physics>
 
-    <plugin name='gz::sim::systems::Physics' filename='gz-sim-physics-system'/>
-    <plugin name='gz::sim::systems::UserCommands' filename='gz-sim-user-commands-system'/>
-    <plugin name='gz::sim::systems::SceneBroadcaster' filename='gz-sim-scene-broadcaster-system'/>
-    <plugin name='gz::sim::systems::Contact' filename='gz-sim-contact-system'/>
-    <plugin name='gz::sim::systems::Imu' filename='gz-sim-imu-system'/>
-    <plugin name='gz::sim::systems::Sensors' filename='gz-sim-sensors-system'>
+    <!-- Plugins -->
+    <plugin filename="ignition-gazebo-physics-system" name="ignition::gazebo::systems::Physics"/>
+    <plugin filename="ignition-gazebo-sensors-system" name="ignition::gazebo::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>
+    <plugin filename="ignition-gazebo-user-commands-system" name="ignition::gazebo::systems::UserCommands"/>
+    <plugin filename="ignition-gazebo-scene-broadcaster-system" name="ignition::gazebo::systems::SceneBroadcaster"/>
+    <plugin filename="ignition-gazebo-imu-system" name="ignition::gazebo::systems::Imu"/>
 
-    <!-- Light -->
+    <!-- Lighting -->
     <light type="directional" name="sun">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 10 0 0 0</pose>
       <diffuse>0.8 0.8 0.8 1</diffuse>
       <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
       <direction>-0.5 0.1 -0.9</direction>
     </light>
 
-    <!-- Ground Plane -->
+    <!-- Ground Plane with neutral gray -->
     <model name="ground_plane">
       <static>true</static>
       <link name="link">
         <collision name="collision">
-          <geometry>
-            <plane>
-              <normal>0 0 1</normal>
-              <size>100 100</size>
-            </plane>
-          </geometry>
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
         </collision>
         <visual name="visual">
-          <geometry>
-            <plane>
-              <normal>0 0 1</normal>
-              <size>100 100</size>
-            </plane>
-          </geometry>
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
           <material>
-            <ambient>0.8 0.8 0.8 1</ambient>
-            <diffuse>0.8 0.8 0.8 1</diffuse>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.4 0.4 0.4 1</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
-    <!-- Include the TurtleBot3 model -->
-    <include>
-      <uri>model://turtlebot3_waffle_pi</uri>
-      <name>turtlebot3</name>
-      <pose>0 0 0.01 0 0 0</pose>
-    </include>
 
-    <!-- ArUco Marker Landmarks (Circular arrangement facing center) -->
+    <!-- Colored Landmark 0 at ring 2.0m -->
+    <model name="landmark_0">
+      <static>true</static>
+      <pose>2.000 0.000 0.280 0 1.5708 3.1416</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.090 0.090 1</ambient>
+            <diffuse>0.900 0.090 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_0</uri>
-      <name>landmark_0</name>
-      <pose>2.00 0.00 0.40 0.0000 1.5708 0.0000</pose>
-    </include>
+    <!-- Colored Landmark 1 at ring 2.0m -->
+    <model name="landmark_1">
+      <static>true</static>
+      <pose>1.414 1.414 0.280 0 1.5708 3.9270</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.292 0.090 1</ambient>
+            <diffuse>0.900 0.292 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_1</uri>
-      <name>landmark_1</name>
-      <pose>1.41 1.41 0.40 0.0000 1.5708 0.7854</pose>
-    </include>
+    <!-- Colored Landmark 2 at ring 2.0m -->
+    <model name="landmark_2">
+      <static>true</static>
+      <pose>0.000 2.000 0.280 0 1.5708 4.7124</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.495 0.090 1</ambient>
+            <diffuse>0.900 0.495 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_2</uri>
-      <name>landmark_2</name>
-      <pose>0.00 2.00 0.40 0.0000 1.5708 1.5708</pose>
-    </include>
+    <!-- Colored Landmark 3 at ring 2.0m -->
+    <model name="landmark_3">
+      <static>true</static>
+      <pose>-1.414 1.414 0.280 0 1.5708 5.4978</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.698 0.090 1</ambient>
+            <diffuse>0.900 0.698 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_3</uri>
-      <name>landmark_3</name>
-      <pose>-1.41 1.41 0.40 0.0000 1.5708 2.3562</pose>
-    </include>
+    <!-- Colored Landmark 4 at ring 2.0m -->
+    <model name="landmark_4">
+      <static>true</static>
+      <pose>-2.000 0.000 0.280 0 1.5708 6.2832</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.900 0.090 1</ambient>
+            <diffuse>0.900 0.900 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_4</uri>
-      <name>landmark_4</name>
-      <pose>-2.00 0.00 0.40 0.0000 1.5708 3.1416</pose>
-    </include>
+    <!-- Colored Landmark 5 at ring 2.0m -->
+    <model name="landmark_5">
+      <static>true</static>
+      <pose>-1.414 -1.414 0.280 0 1.5708 7.0686</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.698 0.900 0.090 1</ambient>
+            <diffuse>0.698 0.900 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_5</uri>
-      <name>landmark_5</name>
-      <pose>-1.41 -1.41 0.40 0.0000 1.5708 3.9270</pose>
-    </include>
+    <!-- Colored Landmark 6 at ring 2.0m -->
+    <model name="landmark_6">
+      <static>true</static>
+      <pose>-0.000 -2.000 0.280 0 1.5708 7.8540</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.495 0.900 0.090 1</ambient>
+            <diffuse>0.495 0.900 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_6</uri>
-      <name>landmark_6</name>
-      <pose>-0.00 -2.00 0.40 0.0000 1.5708 4.7124</pose>
-    </include>
+    <!-- Colored Landmark 7 at ring 2.0m -->
+    <model name="landmark_7">
+      <static>true</static>
+      <pose>1.414 -1.414 0.280 0 1.5708 8.6394</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.292 0.900 0.090 1</ambient>
+            <diffuse>0.292 0.900 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_7</uri>
-      <name>landmark_7</name>
-      <pose>1.41 -1.41 0.40 0.0000 1.5708 5.4978</pose>
-    </include>
+    <!-- Colored Landmark 8 at ring 4.0m -->
+    <model name="landmark_8">
+      <static>true</static>
+      <pose>4.000 0.000 0.280 0 1.5708 3.1416</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.900 0.090 1</ambient>
+            <diffuse>0.090 0.900 0.090 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_8</uri>
-      <name>landmark_8</name>
-      <pose>4.00 0.00 0.40 0.0000 1.5708 0.0000</pose>
-    </include>
+    <!-- Colored Landmark 9 at ring 4.0m -->
+    <model name="landmark_9">
+      <static>true</static>
+      <pose>2.828 2.828 0.280 0 1.5708 3.9270</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.900 0.292 1</ambient>
+            <diffuse>0.090 0.900 0.292 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_9</uri>
-      <name>landmark_9</name>
-      <pose>2.83 2.83 0.40 0.0000 1.5708 0.7854</pose>
-    </include>
+    <!-- Colored Landmark 10 at ring 4.0m -->
+    <model name="landmark_10">
+      <static>true</static>
+      <pose>0.000 4.000 0.280 0 1.5708 4.7124</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.900 0.495 1</ambient>
+            <diffuse>0.090 0.900 0.495 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_10</uri>
-      <name>landmark_10</name>
-      <pose>0.00 4.00 0.40 0.0000 1.5708 1.5708</pose>
-    </include>
+    <!-- Colored Landmark 11 at ring 4.0m -->
+    <model name="landmark_11">
+      <static>true</static>
+      <pose>-2.828 2.828 0.280 0 1.5708 5.4978</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.900 0.698 1</ambient>
+            <diffuse>0.090 0.900 0.698 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_11</uri>
-      <name>landmark_11</name>
-      <pose>-2.83 2.83 0.40 0.0000 1.5708 2.3562</pose>
-    </include>
+    <!-- Colored Landmark 12 at ring 4.0m -->
+    <model name="landmark_12">
+      <static>true</static>
+      <pose>-4.000 0.000 0.280 0 1.5708 6.2832</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.900 0.900 1</ambient>
+            <diffuse>0.090 0.900 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_12</uri>
-      <name>landmark_12</name>
-      <pose>-4.00 0.00 0.40 0.0000 1.5708 3.1416</pose>
-    </include>
+    <!-- Colored Landmark 13 at ring 4.0m -->
+    <model name="landmark_13">
+      <static>true</static>
+      <pose>-2.828 -2.828 0.280 0 1.5708 7.0686</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.698 0.900 1</ambient>
+            <diffuse>0.090 0.698 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_13</uri>
-      <name>landmark_13</name>
-      <pose>-2.83 -2.83 0.40 0.0000 1.5708 3.9270</pose>
-    </include>
+    <!-- Colored Landmark 14 at ring 4.0m -->
+    <model name="landmark_14">
+      <static>true</static>
+      <pose>-0.000 -4.000 0.280 0 1.5708 7.8540</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.495 0.900 1</ambient>
+            <diffuse>0.090 0.495 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_14</uri>
-      <name>landmark_14</name>
-      <pose>-0.00 -4.00 0.40 0.0000 1.5708 4.7124</pose>
-    </include>
+    <!-- Colored Landmark 15 at ring 4.0m -->
+    <model name="landmark_15">
+      <static>true</static>
+      <pose>2.828 -2.828 0.280 0 1.5708 8.6394</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.292 0.900 1</ambient>
+            <diffuse>0.090 0.292 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_15</uri>
-      <name>landmark_15</name>
-      <pose>2.83 -2.83 0.40 0.0000 1.5708 5.4978</pose>
-    </include>
+    <!-- Colored Landmark 16 at ring 6.0m -->
+    <model name="landmark_16">
+      <static>true</static>
+      <pose>6.000 0.000 0.280 0 1.5708 3.1416</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.090 0.090 0.900 1</ambient>
+            <diffuse>0.090 0.090 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_16</uri>
-      <name>landmark_16</name>
-      <pose>6.00 0.00 0.40 0.0000 1.5708 0.0000</pose>
-    </include>
+    <!-- Colored Landmark 17 at ring 6.0m -->
+    <model name="landmark_17">
+      <static>true</static>
+      <pose>4.243 4.243 0.280 0 1.5708 3.9270</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.292 0.090 0.900 1</ambient>
+            <diffuse>0.292 0.090 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_17</uri>
-      <name>landmark_17</name>
-      <pose>4.24 4.24 0.40 0.0000 1.5708 0.7854</pose>
-    </include>
+    <!-- Colored Landmark 18 at ring 6.0m -->
+    <model name="landmark_18">
+      <static>true</static>
+      <pose>0.000 6.000 0.280 0 1.5708 4.7124</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.495 0.090 0.900 1</ambient>
+            <diffuse>0.495 0.090 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_18</uri>
-      <name>landmark_18</name>
-      <pose>0.00 6.00 0.40 0.0000 1.5708 1.5708</pose>
-    </include>
+    <!-- Colored Landmark 19 at ring 6.0m -->
+    <model name="landmark_19">
+      <static>true</static>
+      <pose>-4.243 4.243 0.280 0 1.5708 5.4978</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.698 0.090 0.900 1</ambient>
+            <diffuse>0.698 0.090 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_19</uri>
-      <name>landmark_19</name>
-      <pose>-4.24 4.24 0.40 0.0000 1.5708 2.3562</pose>
-    </include>
+    <!-- Colored Landmark 20 at ring 6.0m -->
+    <model name="landmark_20">
+      <static>true</static>
+      <pose>-6.000 0.000 0.280 0 1.5708 6.2832</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.090 0.900 1</ambient>
+            <diffuse>0.900 0.090 0.900 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_20</uri>
-      <name>landmark_20</name>
-      <pose>-6.00 0.00 0.40 0.0000 1.5708 3.1416</pose>
-    </include>
+    <!-- Colored Landmark 21 at ring 6.0m -->
+    <model name="landmark_21">
+      <static>true</static>
+      <pose>-4.243 -4.243 0.280 0 1.5708 7.0686</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.090 0.698 1</ambient>
+            <diffuse>0.900 0.090 0.698 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_21</uri>
-      <name>landmark_21</name>
-      <pose>-4.24 -4.24 0.40 0.0000 1.5708 3.9270</pose>
-    </include>
+    <!-- Colored Landmark 22 at ring 6.0m -->
+    <model name="landmark_22">
+      <static>true</static>
+      <pose>-0.000 -6.000 0.280 0 1.5708 7.8540</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.090 0.495 1</ambient>
+            <diffuse>0.900 0.090 0.495 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
-    <include>
-      <uri>model://aruco_22</uri>
-      <name>landmark_22</name>
-      <pose>-0.00 -6.00 0.40 0.0000 1.5708 4.7124</pose>
-    </include>
-
-    <include>
-      <uri>model://aruco_23</uri>
-      <name>landmark_23</name>
-      <pose>4.24 -4.24 0.40 0.0000 1.5708 5.4978</pose>
-    </include>
+    <!-- Colored Landmark 23 at ring 6.0m -->
+    <model name="landmark_23">
+      <static>true</static>
+      <pose>4.243 -4.243 0.280 0 1.5708 8.6394</pose>
+      <link name="link">
+        <!-- Main colored square (like ArUco marker) -->
+        <visual name="marker_face">
+          <geometry>
+            <box>
+              <size>0.3 0.3 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.900 0.090 0.292 1</ambient>
+            <diffuse>0.900 0.090 0.292 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <!-- White border for contrast -->
+        <visual name="border">
+          <pose>0 0 -0.005 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.9 1</ambient>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+          </material>
+        </visual>
+        <!-- Support pole -->
+        <visual name="pole">
+          <pose>0 0 -0.140 1.5708 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.02</radius>
+              <length>0.28</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
 
   </world>
 </sdf>
