@@ -100,6 +100,12 @@ class EKFNode(Node):
         self.R_zupt_velocity = 0.001  # (m/s)^2 - very confident velocity is zero when stationary
         self.R_zupt_gravity = 0.1  # Gravity direction measurement noise for tilt correction
 
+        # Vision-based motion detection to prevent false ZUPT
+        # If vision shows robot is moving, disable ZUPT even if gyro is quiet
+        self.last_vision_correction = 0.0  # Position correction from last vision update
+        self.vision_motion_threshold = 0.02  # 2cm correction = robot is moving
+        self.vision_motion_cooldown = 0  # Frames since significant vision correction
+
         # Outlier rejection settings
         self.mahalanobis_threshold = 60.0  # Very relaxed - accept most measurements
         self.consecutive_outliers = 0
@@ -378,32 +384,38 @@ class EKFNode(Node):
         """
         self.get_logger().warn("Re-initializing orientation from current IMU...")
 
-        # Estimate orientation from accelerometer (gravity direction)
+        # CRITICAL: Preserve current yaw! Gravity only gives roll/pitch, not yaw.
+        # Extract current yaw before re-initialization
+        q_current = self.x[6:10]  # [w, x, y, z]
+        rot_current = R.from_quat([q_current[1], q_current[2], q_current[3], q_current[0]])  # scipy format
+        current_euler = rot_current.as_euler('xyz')  # [roll, pitch, yaw]
+        current_yaw = current_euler[2]
+        self.get_logger().info(f"Preserving yaw: {np.degrees(current_yaw):.1f} deg")
+
+        # Estimate roll/pitch from accelerometer (gravity direction)
         accel_norm = np.linalg.norm(a_m)
         if accel_norm < 0.1:
             self.get_logger().error("Accelerometer reading too small, cannot re-initialize")
             return
 
         gravity_body = a_m / accel_norm
-        gravity_world = np.array([0.0, 0.0, 1.0])
 
-        # Find rotation that aligns gravity_body with gravity_world
-        v = np.cross(gravity_body, gravity_world)
-        s = np.linalg.norm(v)
-        c = np.dot(gravity_body, gravity_world)
+        # Compute roll and pitch from gravity direction
+        # gravity_body should be [0, 0, 1] when level
+        # roll = atan2(gy, gz), pitch = atan2(-gx, sqrt(gy^2 + gz^2))
+        new_roll = np.arctan2(gravity_body[1], gravity_body[2])
+        new_pitch = np.arctan2(-gravity_body[0], np.sqrt(gravity_body[1]**2 + gravity_body[2]**2))
 
-        if s < 1e-6:
-            if c > 0:
-                R_init = np.eye(3)
-            else:
-                R_init = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-        else:
-            vx = skew_symmetric(v)
-            R_init = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+        # Clamp roll/pitch for ground robot
+        MAX_TILT = np.radians(10.0)
+        new_roll = np.clip(new_roll, -MAX_TILT, MAX_TILT)
+        new_pitch = np.clip(new_pitch, -MAX_TILT, MAX_TILT)
 
-        # Convert to quaternion
-        rot = R.from_matrix(R_init)
-        q_scipy = rot.as_quat()  # [x, y, z, w]
+        self.get_logger().info(f"New roll={np.degrees(new_roll):.1f}°, pitch={np.degrees(new_pitch):.1f}°, yaw={np.degrees(current_yaw):.1f}° (preserved)")
+
+        # Build quaternion from euler angles, preserving yaw
+        rot_new = R.from_euler('xyz', [new_roll, new_pitch, current_yaw])
+        q_scipy = rot_new.as_quat()  # [x, y, z, w]
         self.x[6:10] = np.array([q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]])
 
         # Reset velocity to zero
@@ -701,14 +713,23 @@ class EKFNode(Node):
         else:
             self.zupt_gyro_only_counter = 0
 
-        # Check if stationary based on gyro only
+        # Check if stationary based on gyro AND vision
         is_stationary = False
+
+        # Decay vision motion cooldown
+        if self.vision_motion_cooldown > 0:
+            self.vision_motion_cooldown -= 1
 
         if len(self.zupt_window) >= self.zupt_window_size:
             avg_gyro = np.mean([s['gyro'] for s in self.zupt_window])
 
-            # Per recommend.md: Use gyro-only detection
-            if avg_gyro < self.zupt_gyro_threshold or self.zupt_gyro_only_counter >= self.zupt_gyro_only_threshold:
+            # Per recommend.md: Use gyro-only detection, BUT also check vision
+            # If vision recently showed motion (position correction), don't ZUPT!
+            gyro_says_stationary = (avg_gyro < self.zupt_gyro_threshold or
+                                    self.zupt_gyro_only_counter >= self.zupt_gyro_only_threshold)
+            vision_says_moving = self.vision_motion_cooldown > 0
+
+            if gyro_says_stationary and not vision_says_moving:
                 is_stationary = True
 
                 # --- ZUPT Part 1: Formal Velocity Update (per recommend.md Section 5) ---
@@ -1298,8 +1319,10 @@ class EKFNode(Node):
         total_pos_correction = np.linalg.norm(x_iter[0:3] - x_orig[0:3])
         pixel_residual = np.linalg.norm(z_res_all) / np.sqrt(valid_count)
 
-        # Sanity check on position correction - be CONSERVATIVE
-        MAX_TOTAL_POS = 0.5  # Maximum position change per vision update (50cm)
+        # Sanity check on position correction - allow larger corrections for recovery
+        # Too small = filter can never recover from drift
+        # Too large = bad measurements cause jumps
+        MAX_TOTAL_POS = 1.5  # Allow up to 1.5m correction to enable recovery
 
         if total_pos_correction > MAX_TOTAL_POS:
             self.get_logger().warn(
@@ -1309,6 +1332,12 @@ class EKFNode(Node):
             self.x = x_orig.copy()
             self.P = P_orig.copy()
             return
+
+        # Track this correction for vision-based motion detection
+        # If we're making significant corrections, robot is moving
+        self.last_vision_correction = total_pos_correction
+        if total_pos_correction > self.vision_motion_threshold:
+            self.vision_motion_cooldown = 100  # ~0.5s at 200Hz - don't ZUPT for a while
 
         # Apply final state - POSITION ONLY
         self.x[0:3] = x_iter[0:3]
