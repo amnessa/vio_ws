@@ -714,11 +714,13 @@ class EKFNode(Node):
         # Gravity in body frame: g_b = R_wb^T @ g_w
         g_body = R_wb.T @ self.g
 
-        # Body-frame acceleration: a_b = a_measured - ba + g_b - ω × v_b
-        # Note: g_body points UP in body frame when robot is level
+        # Body-frame acceleration: a_b = a_measured - ba - g_b - ω × v_b
+        # The accelerometer measures: a_m = a_true - g (specific force)
+        # So: a_true = a_m + g, but we want gravity-compensated acceleration
+        # In body frame: acc_body = a_corrected - g_body (SUBTRACT, not add!)
         # The Coriolis term (ω × v_b) accounts for rotating reference frame
         coriolis = np.cross(w_corrected, v_b)
-        acc_body = a_corrected + g_body - coriolis
+        acc_body = a_corrected - g_body - coriolis  # FIXED: subtract gravity
 
         # --- GROUND ROBOT CONSTRAINTS ---
         # For body-frame: Z-body acceleration should be ~0 (robot doesn't jump)
@@ -840,14 +842,14 @@ class EKFNode(Node):
         F[0:3, 6:9] = -skew_symmetric(R_wb @ v_b)
 
         # --- Velocity error dynamics (body frame) ---
-        # v_b_dot = a_b - ba + R_wb^T @ g - ω × v_b
-        # δv̇_b = -[a_corrected + g_b]_× @ δθ - δba - [ω]_× @ δv_b + [v_b]_× @ δbg
+        # v_b_dot = a_b - ba - g_b - ω × v_b  (FIXED: subtract g_b)
+        # δv̇_b = -[a_corrected - g_b]_× @ δθ - δba - [ω]_× @ δv_b + [v_b]_× @ δbg
         #
         # d(δv_b)/d(δv_b): Coriolis coupling -[ω]_×
         F[3:6, 3:6] = -skew_symmetric(w_corrected)
         # d(δv_b)/d(δθ): How orientation error affects gravity and acceleration
-        # Note: g_body = R_wb^T @ g, so d(g_body)/d(δθ) = [g_body]_×
-        F[3:6, 6:9] = -skew_symmetric(a_corrected + g_body)
+        # Since acc_body = a_corrected - g_body, the Jacobian uses this difference
+        F[3:6, 6:9] = -skew_symmetric(a_corrected - g_body)  # FIXED: subtract g_body
         # d(δv_b)/d(δba): Direct effect of accel bias on body acceleration
         F[3:6, 9:12] = -np.eye(3)
         # d(δv_b)/d(δbg): Gyro bias affects Coriolis term
@@ -1071,16 +1073,11 @@ class EKFNode(Node):
 
     def batch_update(self, observations, buffered_state=None):
         """
-        Batch EKF update using all visible landmarks at once.
+        ITERATED EKF (IEKF) batch update using all visible landmarks.
 
-        Per recommendation2.md: Sequential updates cause linearization errors
-        because the first update changes the state, invalidating the Jacobian
-        linearization point for subsequent updates. Batch updates use a single
-        linearization point for all landmarks, ensuring mathematical consistency.
-
-        Per recommend.md: Use buffered_state (if provided) for computing predicted
-        measurements, then apply correction to current state. This compensates for
-        time delay between image capture and processing.
+        Standard EKF linearizes once at the prior estimate, which fails for large
+        residuals (650+ pixels). IEKF iterates: re-linearize at updated estimate
+        until convergence, effectively performing Gauss-Newton optimization.
 
         Args:
             observations: List of dicts with 'lm_pos', 'u', 'v', 'id'
@@ -1090,284 +1087,208 @@ class EKFNode(Node):
         if n_obs == 0:
             return
 
-        # Use buffered state for computing predicted measurements if available
-        # Per recommend.md: This compensates for time delay between capture and processing
+        # Store original state for potential rollback
+        x_orig = self.x.copy()
+        P_orig = self.P.copy()
+
+        # Use buffered covariance if available
         if buffered_state is not None:
-            # Use state at image capture time for Jacobian linearization
-            x_lin = buffered_state['x']
-            P_lin = buffered_state['P']
+            P_prior = buffered_state['P'].copy()
         else:
-            # Fallback to current state
-            x_lin = self.x
-            P_lin = self.P
+            P_prior = self.P.copy()
 
-        # Extract linearization state
-        p_w = x_lin[0:3]
-        q_w = x_lin[6:10]  # [w,x,y,z]
-        R_wb = R.from_quat([q_w[1], q_w[2], q_w[3], q_w[0]]).as_matrix()
+        # IEKF iteration parameters
+        MAX_ITERATIONS = 10
+        CONVERGENCE_THRESHOLD = 0.01  # meters for position, radians for orientation
 
-        # Stack measurements: each landmark contributes 2 rows (u, v)
-        z_res_stack = []
-        H_stack = []
-        valid_count = 0
+        # Working state for iterations (start from current estimate)
+        x_iter = self.x.copy()
 
-        for obs in observations:
-            lm_pos_world = obs['lm_pos']
-            u_meas = obs['u']
-            v_meas = obs['v']
-            lm_id = obs.get('id', -1)
+        for iteration in range(MAX_ITERATIONS):
+            # Extract current iteration state
+            p_w = x_iter[0:3]
+            q_w = x_iter[6:10]  # [w,x,y,z]
+            R_wb = R.from_quat([q_w[1], q_w[2], q_w[3], q_w[0]]).as_matrix()
 
-            # --- First-Estimate Jacobians (FEJ) ---
-            # Use the pose from when this landmark was FIRST observed for Jacobian computation.
-            # This prevents spurious observability of global yaw ("gravity leakage").
-            if lm_id not in self.landmark_first_estimates:
-                # First time seeing this landmark - store current pose as first estimate
-                self.landmark_first_estimates[lm_id] = {
-                    'p': p_w.copy(),
-                    'R': R_wb.copy()
-                }
-                self.get_logger().info(f"FEJ: First observation of LM{int(lm_id)}, storing pose")
-                # Use current pose for this observation
-                p_fej = p_w
-                R_fej = R_wb
-            else:
-                # Use stored first-estimate pose for Jacobian
-                p_fej = self.landmark_first_estimates[lm_id]['p']
+            # Build measurement model at current linearization point
+            z_res_stack = []
+            H_stack = []
+            valid_count = 0
+
+            for obs in observations:
+                lm_pos_world = obs['lm_pos']
+                u_meas = obs['u']
+                v_meas = obs['v']
+                lm_id = obs.get('id', -1)
+
+                # --- First-Estimate Jacobians (FEJ) for orientation part ---
+                # Store first estimate for new landmarks
+                if lm_id not in self.landmark_first_estimates:
+                    self.landmark_first_estimates[lm_id] = {
+                        'p': p_w.copy(),
+                        'R': R_wb.copy()
+                    }
+                    if iteration == 0:
+                        self.get_logger().info(f"FEJ: First observation of LM{int(lm_id)}, storing pose")
+
+                # Use FEJ rotation for position Jacobian (prevents yaw observability issues)
                 R_fej = self.landmark_first_estimates[lm_id]['R']
 
-            # Transform World -> Body using CURRENT pose for measurement prediction
-            # (we want accurate residuals)
-            p_b = R_wb.T @ (lm_pos_world - p_w)
+                # Transform World -> Body using CURRENT iteration state
+                p_b = R_wb.T @ (lm_pos_world - p_w)
 
-            # Transform Body -> Camera Optical Frame
-            p_c = self.R_b_c @ (p_b - self.t_b_c)
+                # Transform Body -> Camera Optical Frame
+                p_c = self.R_b_c @ (p_b - self.t_b_c)
 
-            # Skip if behind camera
-            if p_c[2] < 0.1:
-                continue
+                # Skip if behind camera
+                if p_c[2] < 0.1:
+                    continue
 
-            # Project to pixels
-            u_pred = self.K[0,0] * p_c[0]/p_c[2] + self.K[0,2]
-            v_pred = self.K[1,1] * p_c[1]/p_c[2] + self.K[1,2]
+                # Project to pixels
+                u_pred = self.K[0,0] * p_c[0]/p_c[2] + self.K[0,2]
+                v_pred = self.K[1,1] * p_c[1]/p_c[2] + self.K[1,2]
 
-            # Residual
-            z_res = np.array([u_meas - u_pred, v_meas - v_pred])
+                # Residual
+                z_res = np.array([u_meas - u_pred, v_meas - v_pred])
 
-            # DEBUG: Log projection details for each marker
-            self.get_logger().info(
-                f"  LM{int(lm_id)}: world={lm_pos_world}, p_c=[{p_c[0]:.2f},{p_c[1]:.2f},{p_c[2]:.2f}], "
-                f"pred=({u_pred:.0f},{v_pred:.0f}), meas=({u_meas:.0f},{v_meas:.0f}), "
-                f"res=[{z_res[0]:.0f},{z_res[1]:.0f}]px",
-                throttle_duration_sec=0.5
-            )
+                # Log on first iteration only
+                if iteration == 0:
+                    self.get_logger().info(
+                        f"  LM{int(lm_id)}: world={lm_pos_world}, p_c=[{p_c[0]:.2f},{p_c[1]:.2f},{p_c[2]:.2f}], "
+                        f"pred=({u_pred:.0f},{v_pred:.0f}), meas=({u_meas:.0f},{v_meas:.0f}), "
+                        f"res=[{z_res[0]:.0f},{z_res[1]:.0f}]px",
+                        throttle_duration_sec=0.5
+                    )
 
-            # Jacobian of Projection
-            fx = self.K[0,0]
-            fy = self.K[1,1]
-            X, Y, Z = p_c
-            J_proj = np.array([
-                [fx/Z, 0, -fx*X/Z**2],
-                [0, fy/Z, -fy*Y/Z**2]
-            ])
+                # Jacobian of Projection
+                fx = self.K[0,0]
+                fy = self.K[1,1]
+                X, Y, Z = p_c
+                J_proj = np.array([
+                    [fx/Z, 0, -fx*X/Z**2],
+                    [0, fy/Z, -fy*Y/Z**2]
+                ])
 
-            # Jacobian w.r.t Position
-            # Use FIRST-ESTIMATE rotation (R_fej) for Jacobian to maintain observability properties
-            J_pos = -self.R_b_c @ R_fej.T
+                # Jacobian w.r.t Position (use FEJ rotation)
+                J_pos = -self.R_b_c @ R_fej.T
 
-            # Jacobian w.r.t Orientation (using skew symmetric)
-            # DISABLED: Orientation updates from vision cause instability.
-            # Even with FEJ, the orientation Jacobian derivation may have sign/convention errors.
-            # Let IMU prediction + ZUPT gravity updates handle orientation.
-            # If enabled, would use: p_b_fej = R_fej.T @ (lm_pos_world - p_fej)
-            # J_rot = -self.R_b_c @ skew_symmetric(p_b_fej)
+                # Assemble H (2x15) for this landmark - POSITION ONLY
+                H = np.zeros((2, 15))
+                H[:, 0:3] = J_proj @ J_pos
 
-            # Assemble H (2x15) for this landmark - POSITION ONLY
-            H = np.zeros((2, 15))
-            H[:, 0:3] = J_proj @ J_pos
-            # H[:, 6:9] = J_proj @ J_rot  # DISABLED
+                z_res_stack.append(z_res)
+                H_stack.append(H)
+                valid_count += 1
 
-            z_res_stack.append(z_res)
-            H_stack.append(H)
-            valid_count += 1
+            if valid_count == 0:
+                return
 
-        if valid_count == 0:
-            return
+            # Enforce 2+ marker requirement
+            if valid_count < 2:
+                self.get_logger().info(
+                    f"Skipping update: only {valid_count} valid marker(s) after filtering",
+                    throttle_duration_sec=1.0
+                )
+                return
 
-        # Enforce 2+ marker requirement for observability (position + yaw)
-        # Single marker updates cause position-yaw coupling errors
-        if valid_count < 2:
-            self.get_logger().info(
-                f"Skipping update: only {valid_count} valid marker(s) after filtering",
-                throttle_duration_sec=1.0
-            )
-            return
+            # Stack into matrices
+            z_res_all = np.concatenate(z_res_stack)
+            H_all = np.vstack(H_stack)
+            R_all = np.eye(2 * valid_count) * self.R_cam
 
-        # Stack into matrices
-        z_res_all = np.concatenate(z_res_stack)  # (2*n,)
-        H_all = np.vstack(H_stack)  # (2*n, 15)
+            # IEKF uses prior covariance, not updated covariance
+            S = H_all @ P_prior @ H_all.T + R_all
+            S = 0.5 * (S + S.T) + np.eye(S.shape[0]) * 1e-6
 
-        # Measurement noise: R_cam for each (u,v) pair
-        R_all = np.eye(2 * valid_count) * self.R_cam
+            try:
+                S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                self.get_logger().warn("Singular S matrix in IEKF, skipping")
+                return
 
-        # Innovation covariance: S = H P H^T + R
-        # Use P_lin (covariance at image capture time) for consistency
-        S = H_all @ P_lin @ H_all.T + R_all
+            # Compute Kalman gain using PRIOR covariance
+            K = P_prior @ H_all.T @ S_inv
 
-        # Ensure S is symmetric and well-conditioned
-        S = 0.5 * (S + S.T)
+            # Compute state correction
+            dx = K @ z_res_all
 
-        # Add small regularization to S for numerical stability
-        S += np.eye(S.shape[0]) * 1e-6
+            # CRITICAL: Vision observes POSITION ONLY.
+            # Zero out all other corrections - they come from P cross-correlations,
+            # NOT from actual observability. Allowing these phantom corrections
+            # corrupts orientation → gravity cancellation fails → divergence.
+            dx[3:6] = 0.0   # Velocity - not directly observed
+            dx[6:9] = 0.0   # Orientation - not observed
+            dx[9:15] = 0.0  # Biases - not observed
 
-        # Outlier check using total residual
-        try:
-            S_inv = np.linalg.inv(S)
-            mahalanobis_sq = z_res_all @ S_inv @ z_res_all
-        except np.linalg.LinAlgError:
-            self.get_logger().warn("Singular S matrix in batch update, skipping")
-            return
+            # Apply correction to iteration state (position only now)
+            x_iter[0:3] += dx[0:3]  # Position
 
-        # Debug: check for numerical issues
-        # Allow tiny negative values (floating point noise) - treat as zero
-        if mahalanobis_sq < -1e-6 or np.isnan(mahalanobis_sq) or np.isinf(mahalanobis_sq):
-            # Log diagnostic info
-            P_diag = np.diag(P_lin)
-            self.get_logger().warn(
-                f"Invalid Mahalanobis: {mahalanobis_sq:.2e}, "
-                f"P_diag_min={P_diag.min():.2e}, P_diag_max={P_diag.max():.2e}, "
-                f"residual_norm={np.linalg.norm(z_res_all):.1f}px"
-            )
-            # Force covariance reset if P is corrupted
-            if P_diag.min() < 0 or P_diag.max() > 1e6:
-                self.get_logger().error("Covariance corrupted - resetting P")
-                self.P = np.eye(15) * 0.1
-            return
+            # Check convergence
+            pos_change = np.linalg.norm(dx[0:3])
 
-        # Clamp tiny negative to zero (floating point noise)
-        mahalanobis_sq = max(0.0, mahalanobis_sq)
+            if iteration > 0 and pos_change < CONVERGENCE_THRESHOLD:
+                self.get_logger().info(
+                    f"IEKF converged in {iteration+1} iterations, final residual={np.linalg.norm(z_res_all)/np.sqrt(valid_count):.1f}px",
+                    throttle_duration_sec=1.0
+                )
+                break
 
-        mahal_dist = np.sqrt(mahalanobis_sq / (2 * valid_count))  # Normalize by DOF
+        # After iteration, check if result is reasonable
+        total_pos_correction = np.linalg.norm(x_iter[0:3] - x_orig[0:3])
         pixel_residual = np.linalg.norm(z_res_all) / np.sqrt(valid_count)
 
-        # Adaptive threshold based on number of observations
-        # More observations = stricter per-observation threshold
-        adaptive_threshold = self.mahalanobis_threshold * np.sqrt(valid_count)
+        # Sanity check on position correction
+        MAX_TOTAL_POS = 2.0  # Maximum position change per vision update
 
-        if mahal_dist > adaptive_threshold:
-            self.consecutive_outliers += 1
-            if self.consecutive_outliers >= self.max_consecutive_outliers:
-                # Huber-weighted update
-                huber_weight = min(1.0, 3.0 / mahal_dist)
-                z_res_all = z_res_all * huber_weight
-                self.get_logger().warn(f"Robust batch update: {valid_count} markers, Mahal={mahal_dist:.1f}")
-                self.consecutive_outliers = 0
-            else:
-                self.get_logger().warn(f"Batch outlier rejected: {valid_count} markers, Mahal={mahal_dist:.1f}")
-                return
-        else:
-            self.consecutive_outliers = 0
+        if total_pos_correction > MAX_TOTAL_POS:
+            self.get_logger().warn(
+                f"IEKF correction too large: pos={total_pos_correction:.2f}m. Clipping."
+            )
+            scale = MAX_TOTAL_POS / total_pos_correction
+            x_iter[0:3] = x_orig[0:3] + (x_iter[0:3] - x_orig[0:3]) * scale
 
-        # Kalman Gain
-        try:
-            K = self.P @ H_all.T @ S_inv
-        except np.linalg.LinAlgError:
-            return
+        # Apply final state - POSITION ONLY
+        self.x[0:3] = x_iter[0:3]
+        # Velocity and orientation unchanged (vision doesn't observe them directly)
 
-        # Error state correction
-        dx = K @ z_res_all
+        # Update covariance - but ONLY for position states
+        # Zero out K rows for unobserved states to prevent false certainty
+        K_masked = K.copy()
+        K_masked[3:, :] = 0.0  # Zero velocity, orientation, bias rows
 
-        # Update covariance (Joseph form)
         I = np.eye(15)
-        IKH = I - K @ H_all
-        self.P = IKH @ self.P @ IKH.T + K @ R_all @ K.T
-
-        # Ensure P stays symmetric and positive semi-definite
+        IKH = I - K_masked @ H_all
+        self.P = IKH @ P_prior @ IKH.T + K_masked @ R_all @ K_masked.T
         self.P = 0.5 * (self.P + self.P.T)
-        # Add tiny regularization to prevent numerical issues
         min_eig = np.min(np.diag(self.P))
         if min_eig < 1e-10:
             self.P += np.eye(15) * 1e-10
 
-        # --- Inject Error into Nominal State ---
+        # Ground constraints
+        self.x[2] = 0.0  # Z position
+        self.x[5] = 0.0  # Z velocity (body frame)
 
-        # Compute correction magnitudes for sanity checking
-        pos_corr_norm = np.linalg.norm(dx[0:3])
-        vel_corr_norm = np.linalg.norm(dx[3:6])
-        rot_corr_norm = np.linalg.norm(dx[6:9])
-        rot_corr_deg = np.degrees(rot_corr_norm)
-
-        # Reject updates with extreme corrections (linearization failure)
-        if pos_corr_norm > 3.0 or vel_corr_norm > 5.0 or rot_corr_deg > 45.0:
-            self.get_logger().error(
-                f"LINEARIZATION FAILURE: pos={pos_corr_norm:.2f}m, vel={vel_corr_norm:.2f}m/s, "
-                f"rot={rot_corr_deg:.1f}deg. Skipping update."
-            )
-            return
-
-        # Position correction with clipping
-        pos_correction = dx[0:3]
-        MAX_POS_CORRECTION = 0.5
-        if pos_corr_norm > MAX_POS_CORRECTION:
-            pos_correction = pos_correction * (MAX_POS_CORRECTION / pos_corr_norm)
-            self.get_logger().warn(f"Position correction clipped: {pos_corr_norm:.2f} -> {MAX_POS_CORRECTION} m")
-        self.x[0:3] += pos_correction
-
-        # Velocity correction with clipping (BODY FRAME velocity)
-        vel_correction = dx[3:6]
-        MAX_VEL_CORRECTION = 0.3
-        if vel_corr_norm > MAX_VEL_CORRECTION:
-            vel_correction = vel_correction * (MAX_VEL_CORRECTION / vel_corr_norm)
-            self.get_logger().warn(f"Body velocity correction clipped: {vel_corr_norm:.2f} -> {MAX_VEL_CORRECTION} m/s")
-        self.x[3:6] += vel_correction
-
-        # CRITICAL: Vision doesn't observe orientation (H[:,6:9]=0), so any non-zero
-        # dx[6:9] comes from P cross-correlations, NOT actual observability.
-        # These "phantom" corrections cause the filter to spin out of control.
-        dx[6:9] = 0.0    # Zero orientation correction
-        dx[9:12] = 0.0   # Zero accel bias correction
-        dx[12:15] = 0.0  # Zero gyro bias correction
-
-        # Orientation is handled by IMU prediction + ZUPT gravity updates
-
-        # Ground constraints - state only, NOT covariance
-        # Per recommend.md: Don't zero covariance rows as it creates near-singular matrix
-        self.x[2] = 0.0
-        self.x[5] = 0.0
-        # Apply soft Z-constraint to covariance (damping, not zeroing)
+        # Apply soft Z-constraint to covariance
         z_damping = 0.5
-        self.P[2, 0:2] *= z_damping
-        self.P[0:2, 2] *= z_damping
-        self.P[2, 3:] *= z_damping
-        self.P[3:, 2] *= z_damping
-        self.P[5, 0:5] *= z_damping
-        self.P[0:5, 5] *= z_damping
-        self.P[5, 6:] *= z_damping
-        self.P[6:, 5] *= z_damping
-        self.P[2, 2] = max(self.P[2, 2] * z_damping, 1e-4)
-        self.P[5, 5] = max(self.P[5, 5] * z_damping, 1e-4)
+        self.P[2, :] *= z_damping
+        self.P[:, 2] *= z_damping
+        self.P[5, :] *= z_damping
+        self.P[:, 5] *= z_damping
+        self.P[2, 2] = max(self.P[2, 2], 1e-4)
+        self.P[5, 5] = max(self.P[5, 5], 1e-4)
 
-        # Velocity sanity check - TurtleBot max is ~0.26 m/s, be conservative
-        MAX_SPEED = 0.5  # Reduced from 2.0 to 0.5 m/s
+        # Velocity sanity check
+        MAX_SPEED = 0.5
         speed = np.linalg.norm(self.x[3:5])
         if speed > MAX_SPEED:
             self.x[3:5] = self.x[3:5] * (MAX_SPEED / speed)
             self.get_logger().warn(f"Speed clamped from {speed:.2f} to {MAX_SPEED} m/s")
 
-        # Position sanity check - TurtleBot shouldn't be more than ~50m from origin in typical use
-        MAX_POS = 50.0  # meters from origin
-        pos_norm = np.linalg.norm(self.x[0:2])
-        if pos_norm > MAX_POS:
-            self.get_logger().error(f"Position exploded to {pos_norm:.1f}m! Resetting to origin.")
-            self.x[0:2] = np.array([0.0, 0.0])
-            self.x[3:5] = np.array([0.0, 0.0])  # Reset velocity too
-            self.P[0:3, 0:3] = np.eye(3) * 2.0  # High position uncertainty
-            self.P[3:6, 3:6] = np.eye(3) * 0.5  # High velocity uncertainty
-
         # Log update
         q = self.x[6:10]
         yaw = R.from_quat([q[1], q[2], q[3], q[0]]).as_euler('zyx')[0]
         self.get_logger().info(
-            f"BATCH UPDATE ({valid_count} markers): pos=[{self.x[0]:.2f}, {self.x[1]:.2f}]m, "
+            f"IEKF UPDATE ({valid_count} markers, {iteration+1} iters): pos=[{self.x[0]:.2f}, {self.x[1]:.2f}]m, "
             f"yaw={np.degrees(yaw):.1f}°, residual={pixel_residual:.1f}px",
             throttle_duration_sec=0.5
         )
