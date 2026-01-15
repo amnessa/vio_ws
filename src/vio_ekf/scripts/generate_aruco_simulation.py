@@ -22,8 +22,9 @@ import os
 import numpy as np
 
 # --- CONFIGURATION ---
-MARKER_COUNT = 24  # Reduced for circular arrangement
-MARKER_SIZE = 0.3  # Meters (30cm) - larger for better detection
+MARKER_COUNT = 24  # Single ring of markers
+MARKER_SIZE = 0.6  # Meters (60cm) - 2x larger for better detection
+RING_RADIUS = 2.5  # Meters - distance from origin to markers
 # Output to package's models directory (Ignition uses GZ_SIM_RESOURCE_PATH)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "models")
@@ -82,7 +83,7 @@ def create_model_files(marker_id):
         <material>
           <ambient>1 1 1 1</ambient>
           <diffuse>1 1 1 1</diffuse>
-          <emissive>0.3 0.3 0.3 1</emissive>
+          <emissive>0 0 0 1</emissive>
           <pbr>
             <metal>
               <albedo_map>{abs_marker_path}</albedo_map>
@@ -169,57 +170,51 @@ def main():
     <!-- ArUco Marker Landmarks (Circular arrangement facing center) -->
 """
 
-    # Place markers in concentric circles around origin
+    # Place markers in a SINGLE circle around origin
     # This ensures the robot always sees multiple markers regardless of heading
-    # Ring 1: 8 markers at radius 2m (close, always visible)
-    # Ring 2: 8 markers at radius 4m
-    # Ring 3: 8 markers at radius 6m
+    # 16 markers evenly spaced = 22.5° apart, guarantees 2-3 visible at any angle
 
     marker_id = 0
-    rings = [
-        (2.0, 8),   # radius, count
-        (4.0, 8),
-        (6.0, 8),
-    ]
+    radius = RING_RADIUS
+    count = MARKER_COUNT
 
-    for radius, count in rings:
-        for j in range(count):
-            create_model_files(marker_id)
+    for j in range(count):
+        create_model_files(marker_id)
 
-            # Position on circle
-            angle = 2 * np.pi * j / count
-            x = radius * np.cos(angle)
-            y = radius * np.sin(angle)
-            z = 0.4  # Camera height is ~0.09m, markers slightly higher
+        # Position on circle
+        angle = 2 * np.pi * j / count
+        x = radius * np.cos(angle)
+        y = radius * np.sin(angle)
+        z = 0.30  # Marker center height (camera is at ~0.09m, looking up slightly)
 
-            # Orientation: marker should face toward origin (toward camera)
-            #
-            # The box geometry has texture on the +Z face (top face).
-            # We want this face to point TOWARD the origin.
-            #
-            # For a marker at position (x, y, z), the direction TO origin is (-x, -y, 0).
-            # We need the +Z axis of the marker to point in direction (-x, -y, 0).
-            #
-            # Strategy:
-            # 1. First rotate around Y by +90° (pitch) to make +Z point toward -X
-            # 2. Then rotate around Z (yaw) to point toward the origin
-            #
-            # Yaw angle: the marker is at angle 'angle' from +X axis,
-            # so to face origin, it needs to rotate by 'angle' around Z
+        # Orientation: marker should face toward origin (toward camera)
+        #
+        # The box geometry has texture on the +Z face (top face).
+        # We want this face to point TOWARD the origin.
+        #
+        # For a marker at position (x, y, z), the direction TO origin is (-x, -y, 0).
+        # We need the +Z axis of the marker to point in direction (-x, -y, 0).
+        #
+        # Strategy:
+        # 1. First rotate around Y by +90° (pitch) to make +Z point toward -X
+        # 2. Then rotate around Z (yaw) to point toward the origin
+        #
+        # Yaw angle: the marker is at angle 'angle' from +X axis,
+        # so to face origin, it needs to rotate by 'angle' around Z
 
-            yaw = angle  # Rotate to face inward
-            pitch = np.pi / 2  # Tilt forward so +Z faces horizontally
-            roll = 0
+        yaw = angle  # Rotate to face inward
+        pitch = np.pi / 2  # Tilt forward so +Z faces horizontally
+        roll = 0
 
-            sdf_content += f"""
+        sdf_content += f"""
     <include>
       <uri>model://aruco_{marker_id}</uri>
       <name>landmark_{marker_id}</name>
       <pose>{x:.2f} {y:.2f} {z:.2f} {roll:.4f} {pitch:.4f} {yaw:.4f}</pose>
     </include>
 """
-            map_dict += f"            {float(marker_id)}: np.array([{x:.2f}, {y:.2f}, {z:.2f}]),\n"
-            marker_id += 1
+        map_dict += f"            {float(marker_id)}: np.array([{x:.2f}, {y:.2f}, {z:.2f}]),\n"
+        marker_id += 1
 
     sdf_content += """
   </world>
