@@ -51,7 +51,16 @@ class EKFNode(Node):
         self.g = np.array([0.0, 0.0, 9.81])  # Gravity vector in world frame (will be updated)
 
         # --- State Definitions ---
-        # State: [p(3), v(3), q(4), ba(3), bg(3)] = 16 elements
+        # ROBOCENTRIC FORMULATION: Velocity is expressed in BODY frame, not world frame.
+        # This decouples observable states (velocity, tilt) from unobservable global yaw.
+        # Reference: "Observability-based Rules for Designing Consistent EKF SLAM Estimators"
+        #
+        # State: [p_w(3), v_b(3), q(4), ba(3), bg(3)] = 16 elements
+        #   - p_w: Position in WORLD frame (for visualization/localization)
+        #   - v_b: Velocity in BODY frame (robocentric - decoupled from yaw uncertainty)
+        #   - q: Quaternion (world to body orientation)
+        #   - ba, bg: IMU biases in body frame
+        #
         # Error State: [dp(3), dv(3), dtheta(3), dba(3), dbg(3)] = 15 elements
         self.x = np.zeros(16)
         self.x[6] = 1.0  # Initial quaternion (w=1, x=0, y=0, z=0)
@@ -449,26 +458,29 @@ class EKFNode(Node):
         with small measurement noise. This collapses velocity covariance and stops
         quadratic position error buildup.
 
-        Measurement model: z = v = H @ x where H selects velocity states
+        ROBOCENTRIC: Velocity is in body frame, so ZUPT directly measures v_b = 0.
+        This is simpler and more natural than world-frame velocity.
+
+        Measurement model: z = v_b = H @ x where H selects velocity states
         Measurement: z_meas = [0, 0, 0]
         """
-        # Current velocity estimate
-        v = self.x[3:6]
+        # Current body-frame velocity estimate
+        v_b = self.x[3:6]
 
         # Skip if velocity already near zero (avoid unnecessary updates)
-        if np.linalg.norm(v) < 0.01:
+        if np.linalg.norm(v_b) < 0.01:
             return
 
-        # Measurement: velocity should be zero
+        # Measurement: body velocity should be zero when stationary
         z_meas = np.array([0.0, 0.0, 0.0])
-        z_pred = v
+        z_pred = v_b
 
         # Residual
-        z_res = z_meas - z_pred  # Should be -v
+        z_res = z_meas - z_pred  # Should be -v_b
 
         # Measurement Jacobian H (3x15): selects velocity states
         H = np.zeros((3, 15))
-        H[0:3, 3:6] = np.eye(3)  # Velocity is states 3:6 in error state
+        H[0:3, 3:6] = np.eye(3)  # Body velocity is states 3:6 in error state
 
         # Measurement noise
         R_zupt = np.eye(3) * self.R_zupt_velocity
@@ -496,7 +508,7 @@ class EKFNode(Node):
         # Only velocity is affected significantly
         self.x[3:6] += dx[3:6]
 
-        # Ground constraint
+        # Ground constraint: body Z velocity should be 0
         self.x[5] = 0.0
 
         # Log only when meaningful correction applied
@@ -623,25 +635,24 @@ class EKFNode(Node):
 
     def predict(self, dt, a_m, w_m):
         """
-        ES-EKF / MEKF Prediction Step (IMU Odometry Model)
+        ES-EKF / MEKF Prediction Step (IMU Odometry Model) - ROBOCENTRIC FORMULATION
 
-        This implements the prediction step of the Error-State Extended Kalman Filter
-        following the multiplicative quaternion formulation from MatthewHampsey/mekf.
+        CRITICAL CHANGE: Velocity is now in BODY FRAME (v_b), not world frame.
+        This decouples observable local motion from unobservable global yaw.
 
-        The prediction consists of two parallel processes:
-        1. Nominal State Propagation - Non-linear kinematics integration
-        2. Error Covariance Propagation - Linearized uncertainty propagation
+        Body-frame velocity dynamics:
+          v_b_dot = a_b - ba + R_wb^T @ g - ω × v_b
 
-        Error State Vector (15D): [δp(3), δv(3), δθ(3), δba(3), δbg(3)]
-        - δθ uses minimal 3D angular representation to avoid quaternion rank deficiency
+        Position update:
+          p_w_dot = R_wb @ v_b
 
-        Reference: prediction_step.md, es_ekf_handbook.md
+        Error State Vector (15D): [δp(3), δv_b(3), δθ(3), δba(3), δbg(3)]
         """
         # ===================================================================
         # STEP 0: Unpack State and Compute Bias-Corrected Measurements
         # ===================================================================
-        p = self.x[0:3]      # Position
-        v = self.x[3:6]      # Velocity
+        p = self.x[0:3]      # Position (world frame)
+        v_b = self.x[3:6]    # Velocity (BODY frame - robocentric!)
         q = self.x[6:10]     # Quaternion [w, x, y, z]
         ba = self.x[10:13]   # Accelerometer bias
         bg = self.x[13:16]   # Gyroscope bias
@@ -650,7 +661,7 @@ class EKFNode(Node):
         rot = R.from_quat([q[1], q[2], q[3], q[0]])  # scipy uses [x, y, z, w]
         R_wb = rot.as_matrix()
 
-        # Bias-corrected IMU measurements
+        # Bias-corrected IMU measurements (both in body frame)
         a_corrected = a_m - ba  # Corrected acceleration in body frame
         w_corrected = w_m - bg  # Corrected angular velocity in body frame
 
@@ -697,32 +708,31 @@ class EKFNode(Node):
 
         # ===================================================================
         # STEP 1: Nominal State Propagation (Non-linear Kinematics)
+        # ROBOCENTRIC: v_b is in body frame, gravity must be transformed to body
         # ===================================================================
-        # Acceleration in world frame (gravity compensated)
-        acc_world = R_wb @ a_corrected - self.g
+
+        # Gravity in body frame: g_b = R_wb^T @ g_w
+        g_body = R_wb.T @ self.g
+
+        # Body-frame acceleration: a_b = a_measured - ba + g_b - ω × v_b
+        # Note: g_body points UP in body frame when robot is level
+        # The Coriolis term (ω × v_b) accounts for rotating reference frame
+        coriolis = np.cross(w_corrected, v_b)
+        acc_body = a_corrected + g_body - coriolis
 
         # --- GROUND ROBOT CONSTRAINTS ---
-        # For a wheeled robot on flat ground:
-        # 1. Z-acceleration should be ~0 (can't fly or sink)
-        # 2. Z-velocity should be ~0
-        # 3. Z-position should be ~0 (ground level)
-
-        # NOTE: Removed aggressive acceleration clipping per recommendations.md
-        # Hard clipping causes divergence when robot experiences shocks/maneuvers
-        # Let the EKF handle uncertainty naturally; only clip truly extreme values
+        # For body-frame: Z-body acceleration should be ~0 (robot doesn't jump)
+        # But we need to be careful - body Z is not world Z when tilted
 
         # Soft limit for extreme cases only (e.g., sensor glitches)
         MAX_ACCEL = 10.0  # m/s² - allow larger transients, only clip glitches
-        acc_world_clipped = np.clip(acc_world, -MAX_ACCEL, MAX_ACCEL)
+        acc_body_clipped = np.clip(acc_body, -MAX_ACCEL, MAX_ACCEL)
 
-        # Zero out Z-axis acceleration for ground robot (can't accelerate vertically)
-        acc_world_clipped[2] = 0.0
-
-        acc_world_norm = np.linalg.norm(acc_world)
+        acc_body_norm = np.linalg.norm(acc_body)
 
         # --- Divergence Watchdog ---
-        if acc_world_norm > 20.0:  # Increased threshold - let filter work
-            self.get_logger().error(f"Filter Divergence! Accel: {acc_world_norm:.1f} m/s^2. Re-initializing from IMU...")
+        if acc_body_norm > 20.0:  # Increased threshold - let filter work
+            self.get_logger().error(f"Filter Divergence! Body Accel: {acc_body_norm:.1f} m/s^2. Re-initializing from IMU...")
             self._reinitialize_orientation(a_m, w_m)
             return
 
@@ -731,31 +741,31 @@ class EKFNode(Node):
             self._debug_counter = 0
         self._debug_counter += 1
         if self._debug_counter % 400 == 1:
-            self.get_logger().info(f"World Accel: [{acc_world[0]:.3f}, {acc_world[1]:.3f}, {acc_world[2]:.3f}] m/s^2")
+            self.get_logger().info(f"Body Accel: [{acc_body[0]:.3f}, {acc_body[1]:.3f}, {acc_body[2]:.3f}] m/s^2")
 
-        # --- Position Update ---
-        # p_k = p_{k-1} + v_{k-1}*dt + 0.5*(R*a_corrected - g)*dt^2
-        p_new = p + v * dt + 0.5 * acc_world_clipped * dt**2
+        # --- Velocity Update (Body Frame) ---
+        # v_b_new = v_b + acc_body * dt
+        v_b_new = v_b + acc_body_clipped * dt
 
-        # Ground constraint: Z should stay near 0
-        p_new[2] = 0.0
+        # For ground robot: body-frame Z velocity should be ~0
+        # (robot doesn't move up/down relative to its own frame)
+        v_b_new[2] = 0.0
 
-        # --- Velocity Update ---
-        # v_k = v_{k-1} + (R*a_corrected - g)*dt
-        v_new = v + acc_world_clipped * dt
-
-        # Ground constraint: Z velocity should be 0
-        v_new[2] = 0.0
-
-        # Velocity damping: prevent unbounded velocity growth
-        # Per recommendation2.md: Only apply extreme safety limits in prediction.
-        # Let the EKF's measurement update naturally correct velocity drift.
-        # The real velocity limit is enforced post-vision-update.
+        # Velocity safety limit
         MAX_SPEED_PREDICT = 10.0  # m/s - high limit for prediction (safety watchdog only)
-        speed = np.linalg.norm(v_new[:2])
+        speed = np.linalg.norm(v_b_new[:2])
         if speed > MAX_SPEED_PREDICT:
-            v_new[:2] = v_new[:2] * (MAX_SPEED_PREDICT / speed)
-            self.get_logger().error(f"DIVERGENCE: Velocity {speed:.2f} m/s clipped in prediction!")
+            v_b_new[:2] = v_b_new[:2] * (MAX_SPEED_PREDICT / speed)
+            self.get_logger().error(f"DIVERGENCE: Body velocity {speed:.2f} m/s clipped in prediction!")
+
+        # --- Position Update (World Frame) ---
+        # p_w_new = p_w + R_wb @ v_b * dt
+        # Note: We use v_b (not v_b_new) for position update (first-order integration)
+        v_world = R_wb @ v_b  # Transform body velocity to world frame for position update
+        p_new = p + v_world * dt
+
+        # Ground constraint: Z position should be 0
+        p_new[2] = 0.0
 
         # --- Orientation Update (Quaternion Integration) ---
         # Using quaternion exponential map: q_k = q_{k-1} ⊗ exp(0.5 * ω_corrected * dt)
@@ -801,40 +811,51 @@ class EKFNode(Node):
 
         # Update Nominal State
         self.x[0:3] = p_new
-        self.x[3:6] = v_new
+        self.x[3:6] = v_b_new  # Body-frame velocity
         self.x[6:10] = q_new
         self.x[10:13] = ba_new
         self.x[13:16] = bg_new
 
         # ===================================================================
         # STEP 2: Error Covariance Propagation (Linearized Uncertainty)
+        # ROBOCENTRIC: Jacobians updated for body-frame velocity
         # ===================================================================
         # The error state Jacobian Fx describes how errors propagate.
         # Fx ≈ I + F*dt where F is the continuous-time error dynamics matrix.
         #
         # Reference: MatthewHampsey/mekf kalman2.py lines 55-69
         #
-        # Error state ordering: [δp, δv, δθ, δba, δbg]
+        # Error state ordering: [δp, δv_b, δθ, δba, δbg]
         #                       [0:3, 3:6, 6:9, 9:12, 12:15]
 
-        # Construct continuous-time Jacobian F
+        # Construct continuous-time Jacobian F for ROBOCENTRIC formulation
         F = np.zeros((15, 15))
 
-        # --- Position error dynamics ---
-        # δṗ = δv
-        F[0:3, 3:6] = np.eye(3)
+        # --- Position error dynamics (world frame) ---
+        # p_w = ∫ R_wb @ v_b dt
+        # δṗ = R_wb @ δv_b + [R_wb @ v_b]_× @ δθ
+        # d(δp)/d(δv_b): Position depends on body velocity through rotation
+        F[0:3, 3:6] = R_wb
+        # d(δp)/d(δθ): Orientation error affects how body velocity maps to world
+        F[0:3, 6:9] = -skew_symmetric(R_wb @ v_b)
 
-        # --- Velocity error dynamics ---
-        # δv̇ = -R*[a_corrected]_× * δθ - R * δba
-        # d(δv)/d(δθ): Rotation of body-frame acceleration by orientation error
-        F[3:6, 6:9] = -R_wb @ skew_symmetric(a_corrected)
-        # d(δv)/d(δba): Effect of accel bias error on velocity
-        F[3:6, 9:12] = -R_wb
+        # --- Velocity error dynamics (body frame) ---
+        # v_b_dot = a_b - ba + R_wb^T @ g - ω × v_b
+        # δv̇_b = -[a_corrected + g_b]_× @ δθ - δba - [ω]_× @ δv_b + [v_b]_× @ δbg
+        #
+        # d(δv_b)/d(δv_b): Coriolis coupling -[ω]_×
+        F[3:6, 3:6] = -skew_symmetric(w_corrected)
+        # d(δv_b)/d(δθ): How orientation error affects gravity and acceleration
+        # Note: g_body = R_wb^T @ g, so d(g_body)/d(δθ) = [g_body]_×
+        F[3:6, 6:9] = -skew_symmetric(a_corrected + g_body)
+        # d(δv_b)/d(δba): Direct effect of accel bias on body acceleration
+        F[3:6, 9:12] = -np.eye(3)
+        # d(δv_b)/d(δbg): Gyro bias affects Coriolis term
+        F[3:6, 12:15] = skew_symmetric(v_b)
 
         # --- Orientation error dynamics ---
         # δθ̇ = -[ω_corrected]_× * δθ - δbg
         # d(δθ)/d(δθ): Gyro measurement coupling (MEKF key insight!)
-        # Reference: MatthewHampsey/mekf kalman2.py line 66: G[0:3, 0:3] = -skewSymmetric(gyro_meas)
         F[6:9, 6:9] = -skew_symmetric(w_corrected)
         # d(δθ)/d(δbg): Effect of gyro bias error on orientation
         F[6:9, 12:15] = -np.eye(3)
@@ -1291,12 +1312,12 @@ class EKFNode(Node):
             self.get_logger().warn(f"Position correction clipped: {pos_corr_norm:.2f} -> {MAX_POS_CORRECTION} m")
         self.x[0:3] += pos_correction
 
-        # Velocity correction with clipping
+        # Velocity correction with clipping (BODY FRAME velocity)
         vel_correction = dx[3:6]
         MAX_VEL_CORRECTION = 0.3
         if vel_corr_norm > MAX_VEL_CORRECTION:
             vel_correction = vel_correction * (MAX_VEL_CORRECTION / vel_corr_norm)
-            self.get_logger().warn(f"Velocity correction clipped: {vel_corr_norm:.2f} -> {MAX_VEL_CORRECTION} m/s")
+            self.get_logger().warn(f"Body velocity correction clipped: {vel_corr_norm:.2f} -> {MAX_VEL_CORRECTION} m/s")
         self.x[3:6] += vel_correction
 
         # CRITICAL: Vision doesn't observe orientation (H[:,6:9]=0), so any non-zero
@@ -1563,9 +1584,11 @@ class EKFNode(Node):
         odom.pose.pose.orientation.y = self.x[8]
         odom.pose.pose.orientation.z = self.x[9]
 
-        odom.twist.twist.linear.x = self.x[3]
-        odom.twist.twist.linear.y = self.x[4]
-        odom.twist.twist.linear.z = self.x[5]
+        # Twist is in body frame (child_frame_id = base_footprint)
+        # This matches ROS convention and our robocentric state representation
+        odom.twist.twist.linear.x = self.x[3]  # Body-frame forward velocity
+        odom.twist.twist.linear.y = self.x[4]  # Body-frame lateral velocity
+        odom.twist.twist.linear.z = self.x[5]  # Body-frame vertical velocity
 
         self.pub_odom.publish(odom)
 
