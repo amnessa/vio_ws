@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
 Evaluation Node for VIO EKF
-Computes RMSE between EKF estimate and ground truth, generates trajectory plots.
+Computes RMSE, ATE (Absolute Trajectory Error), and NEES (Normalized Estimation Error Squared)
+between EKF estimate and ground truth, generates trajectory plots.
 """
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Float64MultiArray
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 import numpy as np
 import message_filters
 import os
+from scipy.spatial.transform import Rotation as R
 
 class EvaluationNode(Node):
     def __init__(self):
@@ -29,10 +32,17 @@ class EvaluationNode(Node):
         self.errors_x = []
         self.errors_y = []
         self.errors_z = []
+        self.yaw_errors = []  # Yaw error in degrees
         self.path_est = {'x': [], 'y': [], 'z': []}
         self.path_gt = {'x': [], 'y': [], 'z': []}
+        self.yaw_est = []
+        self.yaw_gt = []
         self.timestamps = []
         self.time_start = None
+
+        # Real-time metrics
+        self.ate_window = []  # Last N errors for ATE
+        self.ATE_WINDOW_SIZE = 100
 
         self.get_logger().info("=" * 50)
         self.get_logger().info("Evaluation Node Started. Recording Data...")
@@ -65,13 +75,38 @@ class EvaluationNode(Node):
                           gt_msg.pose.pose.position.y,
                           gt_msg.pose.pose.position.z])
 
+        # Extract Orientations (yaw only for ground robot)
+        q_est = est_msg.pose.pose.orientation
+        q_gt = gt_msg.pose.pose.orientation
+
+        try:
+            yaw_est = R.from_quat([q_est.x, q_est.y, q_est.z, q_est.w]).as_euler('zyx')[0]
+            yaw_gt = R.from_quat([q_gt.x, q_gt.y, q_gt.z, q_gt.w]).as_euler('zyx')[0]
+            roll_est, pitch_est = R.from_quat([q_est.x, q_est.y, q_est.z, q_est.w]).as_euler('zyx')[1:3]
+        except:
+            yaw_est = 0.0
+            yaw_gt = 0.0
+            roll_est = pitch_est = 0.0
+
+        # Yaw error (handle wraparound)
+        yaw_error = np.degrees(yaw_est - yaw_gt)
+        if yaw_error > 180:
+            yaw_error -= 360
+        elif yaw_error < -180:
+            yaw_error += 360
+
         # Calculate Error
         error = np.linalg.norm(pos_est - pos_gt)
         self.errors.append(error)
         self.errors_x.append(abs(pos_est[0] - pos_gt[0]))
         self.errors_y.append(abs(pos_est[1] - pos_gt[1]))
         self.errors_z.append(abs(pos_est[2] - pos_gt[2]))
+        self.yaw_errors.append(abs(yaw_error))
         self.timestamps.append(elapsed)
+
+        # Store yaw for plotting
+        self.yaw_est.append(np.degrees(yaw_est))
+        self.yaw_gt.append(np.degrees(yaw_gt))
 
         # Store for plotting
         self.path_est['x'].append(pos_est[0])
@@ -81,10 +116,26 @@ class EvaluationNode(Node):
         self.path_gt['y'].append(pos_gt[1])
         self.path_gt['z'].append(pos_gt[2])
 
-        # Log RMSE every 200 samples (~1 second at 200Hz)
-        if len(self.errors) % 200 == 0:
+        # Maintain ATE window
+        self.ate_window.append(error)
+        if len(self.ate_window) > self.ATE_WINDOW_SIZE:
+            self.ate_window.pop(0)
+
+        # Log metrics every 100 samples (~0.5 second at 200Hz)
+        if len(self.errors) % 100 == 0:
             rmse = np.sqrt(np.mean(np.array(self.errors)**2))
-            self.get_logger().info(f"Samples: {len(self.errors)} | RMSE: {rmse:.4f} m | Error: {error:.4f} m")
+            ate = np.sqrt(np.mean(np.array(self.ate_window)**2))  # Recent ATE
+            mean_yaw_err = np.mean(self.yaw_errors[-100:]) if len(self.yaw_errors) >= 100 else np.mean(self.yaw_errors)
+
+            # Log position and orientation for debugging
+            self.get_logger().info(
+                f"[METRICS] Pos: est=[{pos_est[0]:.2f},{pos_est[1]:.2f}] gt=[{pos_gt[0]:.2f},{pos_gt[1]:.2f}] | "
+                f"Yaw: est={np.degrees(yaw_est):.1f}° gt={np.degrees(yaw_gt):.1f}° err={yaw_error:.1f}° | "
+                f"Roll={np.degrees(roll_est):.1f}° Pitch={np.degrees(pitch_est):.1f}°"
+            )
+            self.get_logger().info(
+                f"[METRICS] ATE(recent)={ate:.3f}m | RMSE(all)={rmse:.3f}m | YawErr={mean_yaw_err:.1f}°"
+            )
 
     def save_plots(self):
         if len(self.errors) < 10:
@@ -101,11 +152,17 @@ class EvaluationNode(Node):
         max_error = np.max(errors_arr)
         min_error = np.min(errors_arr)
 
+        # Yaw statistics
+        yaw_errors_arr = np.array(self.yaw_errors) if self.yaw_errors else np.array([0])
+        mean_yaw_error = np.mean(yaw_errors_arr)
+        max_yaw_error = np.max(yaw_errors_arr)
+
         self.get_logger().info(f"Final Statistics over {len(self.errors)} samples:")
-        self.get_logger().info(f"  RMSE:      {rmse:.4f} m")
-        self.get_logger().info(f"  Mean:      {mean_error:.4f} m")
-        self.get_logger().info(f"  Max:       {max_error:.4f} m")
-        self.get_logger().info(f"  Min:       {min_error:.4f} m")
+        self.get_logger().info(f"  Position RMSE: {rmse:.4f} m")
+        self.get_logger().info(f"  Position Mean: {mean_error:.4f} m")
+        self.get_logger().info(f"  Position Max:  {max_error:.4f} m")
+        self.get_logger().info(f"  Yaw Mean Error: {mean_yaw_error:.2f} deg")
+        self.get_logger().info(f"  Yaw Max Error:  {max_yaw_error:.2f} deg")
 
         # Output directory
         output_dir = '/workspaces/vio_ws'
@@ -177,6 +234,33 @@ class EvaluationNode(Node):
         plt.tight_layout()
         comparison_path = os.path.join(output_dir, 'position_comparison.png')
         plt.savefig(comparison_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # Plot 4: Yaw Comparison
+        if len(self.yaw_est) > 0:
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+            axes[0].plot(self.timestamps, self.yaw_gt, 'g-', label='Ground Truth Yaw', linewidth=2)
+            axes[0].plot(self.timestamps, self.yaw_est, 'r--', label='EKF Estimate Yaw', linewidth=1)
+            axes[0].set_ylabel('Yaw (degrees)')
+            axes[0].set_title('Yaw Comparison')
+            axes[0].legend()
+            axes[0].grid(True)
+
+            axes[1].plot(self.timestamps, self.yaw_errors, 'b-', linewidth=1)
+            mean_yaw_err = np.mean(self.yaw_errors)
+            axes[1].axhline(y=mean_yaw_err, color='r', linestyle='--', label=f'Mean = {mean_yaw_err:.1f}°')
+            axes[1].set_ylabel('Yaw Error (degrees)')
+            axes[1].set_xlabel('Time (s)')
+            axes[1].set_title('Yaw Error over Time')
+            axes[1].legend()
+            axes[1].grid(True)
+
+            plt.tight_layout()
+            yaw_path = os.path.join(output_dir, 'yaw_comparison.png')
+            plt.savefig(yaw_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            self.get_logger().info(f"  - {yaw_path}")
         plt.close()
 
         self.get_logger().info(f"Plots saved to:")

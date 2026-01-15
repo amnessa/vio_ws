@@ -584,21 +584,35 @@ class EKFNode(Node):
             return
 
         # Outlier rejection (very high residual indicates something wrong)
-        # Relaxed threshold to allow gravity corrections during recovery
-        if mahal_sq > 200.0:
+        # BUT: Don't reject too aggressively - orientation NEEDS correction!
+        # If we reject, the filter can never recover from bad orientation.
+        # Instead, apply the correction but limit its magnitude.
+        MAHAL_HARD_REJECT = 1000.0  # Only reject truly crazy values
+        MAHAL_LIMIT_CORRECTION = 100.0  # Limit correction above this
+
+        if mahal_sq > MAHAL_HARD_REJECT:
             self.get_logger().warn(
-                f"ZUPT gravity: Large residual rejected (Mahal={np.sqrt(mahal_sq):.1f})",
+                f"ZUPT gravity: Extreme residual rejected (Mahal={np.sqrt(mahal_sq):.1f})",
                 throttle_duration_sec=2.0
             )
             return
 
+        # For moderate outliers, proceed but limit correction magnitude
+        correction_scale = 1.0
+        if mahal_sq > MAHAL_LIMIT_CORRECTION:
+            correction_scale = MAHAL_LIMIT_CORRECTION / mahal_sq
+            self.get_logger().warn(
+                f"ZUPT gravity: Large residual, scaling correction by {correction_scale:.2f}",
+                throttle_duration_sec=2.0
+            )
+
         # Kalman gain
         K = self.P @ H.T @ S_inv
 
-        # Error state correction
-        dx = K @ z_res
+        # Error state correction (apply scaling for outliers)
+        dx = correction_scale * (K @ z_res)
 
-        # Update covariance (Joseph form)
+        # Update covariance (Joseph form) - always update P even for scaled corrections
         I = np.eye(15)
         IKH = I - K @ H
         self.P = IKH @ self.P @ IKH.T + K @ R_gravity @ K.T
@@ -610,9 +624,10 @@ class EKFNode(Node):
         rot_corr_norm = np.linalg.norm(rot_correction)
 
         if rot_corr_norm > 1e-8:
-            # Limit large corrections to prevent instability
-            if rot_corr_norm > 0.1:  # ~6 degrees max per update
-                rot_correction = rot_correction * (0.1 / rot_corr_norm)
+            # Limit large corrections - but allow bigger than before to recover faster
+            MAX_ROT_CORR = 0.2  # ~12 degrees max per update (was 0.1)
+            if rot_corr_norm > MAX_ROT_CORR:
+                rot_correction = rot_correction * (MAX_ROT_CORR / rot_corr_norm)
 
             dq_rot = R.from_rotvec(rot_correction)
             q_new_obj = rot * dq_rot  # Apply rotation correction
@@ -753,12 +768,16 @@ class EKFNode(Node):
         # (robot doesn't move up/down relative to its own frame)
         v_b_new[2] = 0.0
 
-        # Velocity safety limit
-        MAX_SPEED_PREDICT = 10.0  # m/s - high limit for prediction (safety watchdog only)
+        # Velocity safety limit - TIGHT for ground robot
+        # Robot physically cannot exceed ~2 m/s, so any higher is divergence
+        MAX_SPEED_PREDICT = 2.0  # m/s - physical limit for this robot
         speed = np.linalg.norm(v_b_new[:2])
         if speed > MAX_SPEED_PREDICT:
             v_b_new[:2] = v_b_new[:2] * (MAX_SPEED_PREDICT / speed)
-            self.get_logger().error(f"DIVERGENCE: Body velocity {speed:.2f} m/s clipped in prediction!")
+            self.get_logger().warn(
+                f"Speed limited from {speed:.2f} to {MAX_SPEED_PREDICT:.1f} m/s",
+                throttle_duration_sec=1.0
+            )
 
         # --- Position Update (World Frame) ---
         # p_w_new = p_w + R_wb @ v_b * dt
@@ -773,6 +792,17 @@ class EKFNode(Node):
         # Using quaternion exponential map: q_k = q_{k-1} ⊗ exp(0.5 * ω_corrected * dt)
         # Reference: MatthewHampsey/mekf model.py - quaternion derivative method
         w_norm = np.linalg.norm(w_corrected)
+
+        # Log gyro activity for debugging rotation issues
+        if not hasattr(self, '_gyro_debug_counter'):
+            self._gyro_debug_counter = 0
+        self._gyro_debug_counter += 1
+        if self._gyro_debug_counter % 400 == 1 and w_norm > 0.05:
+            self.get_logger().info(
+                f"Gyro: wx={w_corrected[0]:.3f}, wy={w_corrected[1]:.3f}, wz={w_corrected[2]:.3f} rad/s | "
+                f"bias: [{bg[0]:.4f},{bg[1]:.4f},{bg[2]:.4f}]"
+            )
+
         if w_norm > 1e-8:
             # Exact quaternion exponential for rotation vector θ = ω*dt
             # Δq = [cos(|θ|/2), sin(|θ|/2) * θ/|θ|]
@@ -793,6 +823,28 @@ class EKFNode(Node):
             # For very small rotations, quaternion stays the same
             q_new = q.copy()
 
+        # --- GROUND ROBOT CONSTRAINT: Limit Roll/Pitch ---
+        # A ground robot cannot physically have large roll or pitch angles.
+        # Clamp to ±10 degrees to prevent divergence.
+        MAX_TILT = np.radians(10.0)  # 10 degrees max tilt
+        rot_new = R.from_quat([q_new[1], q_new[2], q_new[3], q_new[0]])
+        euler_new = rot_new.as_euler('zyx')  # [yaw, pitch, roll]
+        yaw_new, pitch_new, roll_new = euler_new
+
+        # Clamp roll and pitch
+        if abs(roll_new) > MAX_TILT or abs(pitch_new) > MAX_TILT:
+            roll_clamped = np.clip(roll_new, -MAX_TILT, MAX_TILT)
+            pitch_clamped = np.clip(pitch_new, -MAX_TILT, MAX_TILT)
+            # Reconstruct quaternion with clamped angles
+            rot_clamped = R.from_euler('zyx', [yaw_new, pitch_clamped, roll_clamped])
+            q_clamped = rot_clamped.as_quat()  # [x, y, z, w]
+            q_new = np.array([q_clamped[3], q_clamped[0], q_clamped[1], q_clamped[2]])
+            self.get_logger().warn(
+                f"Orientation clamped: roll {np.degrees(roll_new):.1f}→{np.degrees(roll_clamped):.1f}°, "
+                f"pitch {np.degrees(pitch_new):.1f}→{np.degrees(pitch_clamped):.1f}°",
+                throttle_duration_sec=2.0
+            )
+
         # --- Bias Update (Random Walk Model) ---
         # Biases are constant in the prediction step (drift added via process noise)
         ba_new = ba.copy()
@@ -808,8 +860,6 @@ class EKFNode(Node):
         ba_new = np.clip(ba_new, -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
         bg_new = np.clip(bg_new, -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
 
-        # NOTE: VELOCITY_DECAY removed per recommendations.md
-        # Non-physical damping fights against visual updates. Let EKF handle drift naturally.
 
         # Update Nominal State
         self.x[0:3] = p_new
@@ -1151,6 +1201,17 @@ class EKFNode(Node):
                 # Residual
                 z_res = np.array([u_meas - u_pred, v_meas - v_pred])
 
+                # GATE large residuals - reject observations with > 100px error
+                # These indicate wrong data association or severely wrong state estimate
+                residual_norm = np.linalg.norm(z_res)
+                if residual_norm > 100.0:
+                    if iteration == 0:
+                        self.get_logger().warn(
+                            f"  LM{int(lm_id)}: REJECTED (res={residual_norm:.0f}px > 100px gate)",
+                            throttle_duration_sec=0.5
+                        )
+                    continue  # Skip this observation
+
                 # Log on first iteration only
                 if iteration == 0:
                     self.get_logger().info(
@@ -1237,15 +1298,17 @@ class EKFNode(Node):
         total_pos_correction = np.linalg.norm(x_iter[0:3] - x_orig[0:3])
         pixel_residual = np.linalg.norm(z_res_all) / np.sqrt(valid_count)
 
-        # Sanity check on position correction
-        MAX_TOTAL_POS = 2.0  # Maximum position change per vision update
+        # Sanity check on position correction - be CONSERVATIVE
+        MAX_TOTAL_POS = 0.5  # Maximum position change per vision update (50cm)
 
         if total_pos_correction > MAX_TOTAL_POS:
             self.get_logger().warn(
-                f"IEKF correction too large: pos={total_pos_correction:.2f}m. Clipping."
+                f"IEKF correction too large: pos={total_pos_correction:.2f}m > {MAX_TOTAL_POS}m. REJECTING update."
             )
-            scale = MAX_TOTAL_POS / total_pos_correction
-            x_iter[0:3] = x_orig[0:3] + (x_iter[0:3] - x_orig[0:3]) * scale
+            # Restore original state and covariance - don't apply bad update
+            self.x = x_orig.copy()
+            self.P = P_orig.copy()
+            return
 
         # Apply final state - POSITION ONLY
         self.x[0:3] = x_iter[0:3]
