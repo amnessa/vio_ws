@@ -142,6 +142,14 @@ class EKFNode(Node):
             23.0: np.array([2.97, -2.97, 0.30]),
         }
 
+        # First-Estimate Jacobians (FEJ) storage
+        # Stores the robot pose (position, orientation) when each landmark was first observed.
+        # Using these "first estimates" for Jacobian computation prevents spurious observability
+        # of global yaw, which causes "gravity leakage" where yaw errors contaminate velocity.
+        # Reference: Huang, Mourikis, Roumeliotis - "Observability-based Rules for Designing
+        # Consistent EKF SLAM Estimators" (IJRR 2010)
+        self.landmark_first_estimates = {}  # lm_id -> {'p': position, 'R': rotation_matrix}
+
         # Calibration (Extrinsics: Base -> Camera Optical Frame)
         # Camera moved forward to 0.10m to avoid robot body blocking view
         # Total translation: [0.10, 0.0, 0.093]
@@ -423,6 +431,12 @@ class EKFNode(Node):
         self.P[6:9, 6:9] = np.eye(3) * 0.3    # Orientation uncertainty
         self.P[9:12, 9:12] = np.eye(3) * 0.2  # Accel bias - higher uncertainty to re-learn
         self.P[12:15, 12:15] = np.eye(3) * 0.1  # Gyro bias uncertainty
+
+        # Reset First-Estimate Jacobian storage
+        # After reinitialization, the old first-estimates are stale and would cause
+        # inconsistent linearization. Clear them so landmarks get fresh first-estimates.
+        self.landmark_first_estimates.clear()
+        self.get_logger().info("FEJ: Cleared first-estimate storage after reinitialization")
 
         self.get_logger().info(f"Re-initialized quat: w={self.x[6]:.3f}, x={self.x[7]:.3f}, y={self.x[8]:.3f}, z={self.x[9]:.3f}")
 
@@ -1082,7 +1096,26 @@ class EKFNode(Node):
             v_meas = obs['v']
             lm_id = obs.get('id', -1)
 
-            # Transform World -> Body
+            # --- First-Estimate Jacobians (FEJ) ---
+            # Use the pose from when this landmark was FIRST observed for Jacobian computation.
+            # This prevents spurious observability of global yaw ("gravity leakage").
+            if lm_id not in self.landmark_first_estimates:
+                # First time seeing this landmark - store current pose as first estimate
+                self.landmark_first_estimates[lm_id] = {
+                    'p': p_w.copy(),
+                    'R': R_wb.copy()
+                }
+                self.get_logger().info(f"FEJ: First observation of LM{int(lm_id)}, storing pose")
+                # Use current pose for this observation
+                p_fej = p_w
+                R_fej = R_wb
+            else:
+                # Use stored first-estimate pose for Jacobian
+                p_fej = self.landmark_first_estimates[lm_id]['p']
+                R_fej = self.landmark_first_estimates[lm_id]['R']
+
+            # Transform World -> Body using CURRENT pose for measurement prediction
+            # (we want accurate residuals)
             p_b = R_wb.T @ (lm_pos_world - p_w)
 
             # Transform Body -> Camera Optical Frame
@@ -1117,13 +1150,15 @@ class EKFNode(Node):
             ])
 
             # Jacobian w.r.t Position
-            J_pos = -self.R_b_c @ R_wb.T
+            # Use FIRST-ESTIMATE rotation (R_fej) for Jacobian to maintain observability properties
+            J_pos = -self.R_b_c @ R_fej.T
 
             # Jacobian w.r.t Orientation (using skew symmetric)
             # DISABLED: Orientation updates from vision cause instability.
-            # The Jacobian derivation may have sign/convention errors.
+            # Even with FEJ, the orientation Jacobian derivation may have sign/convention errors.
             # Let IMU prediction + ZUPT gravity updates handle orientation.
-            # J_rot = -self.R_b_c @ skew_symmetric(p_b)
+            # If enabled, would use: p_b_fej = R_fej.T @ (lm_pos_world - p_fej)
+            # J_rot = -self.R_b_c @ skew_symmetric(p_b_fej)
 
             # Assemble H (2x15) for this landmark - POSITION ONLY
             H = np.zeros((2, 15))
