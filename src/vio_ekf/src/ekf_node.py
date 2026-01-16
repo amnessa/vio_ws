@@ -4,6 +4,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu, CameraInfo
 from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped
 from nav_msgs.msg import Path, Odometry
+from std_msgs.msg import Float64MultiArray
 from tf2_ros import TransformBroadcaster
 
 import numpy as np
@@ -76,7 +77,7 @@ class EKFNode(Node):
 
         # Noise Parameters - Tuned for Gazebo simulation
         # Higher values = trust IMU less, allow more vision correction
-        self.sigma_a = 1.0      # Accel noise stddev (m/s^2) - higher for Gazebo
+        self.sigma_a = 1.5      # Accel noise stddev (m/s^2) - higher for Gazebo
         self.sigma_g = 0.5     # Gyro noise stddev (rad/s) - accounts for simulation noise
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
@@ -85,7 +86,7 @@ class EKFNode(Node):
         # Reduced from 5e-4 to allow slower, more stable bias estimation.
         self.Q_ba = 1e-4  # Accel bias random walk - slower adaptation
         self.Q_bg = 1e-5  # Gyro bias random walk - slower adaptation
-        self.R_cam = 70.0   # Pixel measurement noise - INCREASED to trust vision less (prevents velocity explosion)
+        self.R_cam = 35.0   # Pixel measurement noise - INCREASED to trust vision less (prevents velocity explosion)
 
         # ZUPT (Zero-Velocity Update) parameters
         # Per recommend.md Section 5: Trigger ZUPT based solely on gyro activity
@@ -105,6 +106,13 @@ class EKFNode(Node):
         self.last_vision_correction = 0.0  # Position correction from last vision update
         self.vision_motion_threshold = 0.02  # 2cm correction = robot is moving
         self.vision_motion_cooldown = 0  # Frames since significant vision correction
+
+        # IMU Downsampling: 200Hz → 50Hz by averaging every 4 samples
+        # This smooths out spikes and noise before EKF sees them
+        # A single 50 m/s² spike becomes 12.5 m/s² after averaging with 3 normal samples
+        self.imu_buffer = []  # Buffer to collect 4 samples
+        self.imu_downsample_factor = 4  # Average every 4 samples (200Hz → 50Hz)
+        self.imu_accumulated_dt = 0.0  # Accumulated time for the batch
 
         # Outlier rejection settings
         self.mahalanobis_threshold = 60.0  # Very relaxed - accept most measurements
@@ -205,6 +213,7 @@ class EKFNode(Node):
 
         self.pub_odom = self.create_publisher(Odometry, '/vio/odom', 10)
         self.pub_path = self.create_publisher(Path, '/vio/path', 10)
+        self.pub_diag = self.create_publisher(Float64MultiArray, '/vio/diagnostics', 10)
         self.tf_br = TransformBroadcaster(self)
 
         self.get_logger().info("EKF Node Initialized")
@@ -240,17 +249,37 @@ class EKFNode(Node):
 
         # --- TIME JUMP SAFETY ---
         # If dt is larger than 100ms (we expect ~5ms at 200Hz), skip this message
-        # This prevents huge integration errors from bag file jumps or pauses
         if dt > 0.1:
             self.get_logger().warn(f"Huge time jump detected (dt={dt:.4f}s). Skipping prediction step.")
             self.last_imu_time = curr_time
+            self.imu_buffer.clear()  # Clear buffer on time jump
+            self.imu_accumulated_dt = 0.0
             return
         if dt <= 0:
-            return # Skip backwards or duplicate messages
+            return  # Skip backwards or duplicate messages
         self.last_imu_time = curr_time
 
-        # --- PREDICTION STEP ---
-        self.predict(dt, a_m, w_m)
+        # --- IMU DOWNSAMPLING: 200Hz → 50Hz ---
+        # Accumulate samples and average every N samples
+        # This smooths out spikes: a single 50 m/s² spike with 3 normal samples → 12.5 m/s²
+        self.imu_buffer.append({'accel': a_m, 'gyro': w_m})
+        self.imu_accumulated_dt += dt
+
+        if len(self.imu_buffer) < self.imu_downsample_factor:
+            # Not enough samples yet, wait for more
+            return
+
+        # Average the buffered samples
+        avg_accel = np.mean([s['accel'] for s in self.imu_buffer], axis=0)
+        avg_gyro = np.mean([s['gyro'] for s in self.imu_buffer], axis=0)
+        batch_dt = self.imu_accumulated_dt
+
+        # Clear buffer for next batch
+        self.imu_buffer.clear()
+        self.imu_accumulated_dt = 0.0
+
+        # --- PREDICTION STEP with averaged IMU data ---
+        self.predict(batch_dt, avg_accel, avg_gyro)
         self.publish_state(msg.header.stamp)
 
     def initialize_from_imu(self):
@@ -1222,13 +1251,13 @@ class EKFNode(Node):
                 # Residual
                 z_res = np.array([u_meas - u_pred, v_meas - v_pred])
 
-                # GATE large residuals - reject observations with > 150px error
+                # GATE large residuals - reject observations with > 100px error
                 # These indicate wrong data association or severely wrong state estimate
                 residual_norm = np.linalg.norm(z_res)
-                if residual_norm > 150.0:
+                if residual_norm > 100.0:
                     if iteration == 0:
                         self.get_logger().warn(
-                            f"  LM{int(lm_id)}: REJECTED (res={residual_norm:.0f}px > 150px gate)",
+                            f"  LM{int(lm_id)}: REJECTED (res={residual_norm:.0f}px > 100px gate)",
                             throttle_duration_sec=0.5
                         )
                     continue  # Skip this observation
@@ -1372,7 +1401,7 @@ class EKFNode(Node):
         self.P[5, 5] = max(self.P[5, 5], 1e-4)
 
         # Velocity sanity check
-        MAX_SPEED = 1.0
+        MAX_SPEED = 0.5
         speed = np.linalg.norm(self.x[3:5])
         if speed > MAX_SPEED:
             self.x[3:5] = self.x[3:5] * (MAX_SPEED / speed)
@@ -1636,6 +1665,35 @@ class EKFNode(Node):
         self.path_msg.poses.append(pose)
         if len(self.path_msg.poses) > 500: self.path_msg.poses.pop(0)
         self.pub_path.publish(self.path_msg)
+
+        # Publish Diagnostics for tuning/debugging
+        # Format: [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z,
+        #          P_pos_x, P_pos_y, P_pos_z, P_vel_x, P_vel_y, P_vel_z,
+        #          P_ori_x, P_ori_y, P_ori_z, P_ba_x, P_ba_y, P_ba_z, P_bg_x, P_bg_y, P_bg_z,
+        #          vx, vy, vz, speed, last_vision_correction]
+        diag = Float64MultiArray()
+        P_diag = np.diag(self.P)
+        speed = np.linalg.norm(self.x[3:5])
+        diag.data = [
+            # Biases (6 values)
+            float(self.x[10]), float(self.x[11]), float(self.x[12]),  # accel bias
+            float(self.x[13]), float(self.x[14]), float(self.x[15]),  # gyro bias
+            # Covariance diagonal - position (3 values)
+            float(P_diag[0]), float(P_diag[1]), float(P_diag[2]),
+            # Covariance diagonal - velocity (3 values)
+            float(P_diag[3]), float(P_diag[4]), float(P_diag[5]),
+            # Covariance diagonal - orientation (3 values)
+            float(P_diag[6]), float(P_diag[7]), float(P_diag[8]),
+            # Covariance diagonal - accel bias (3 values)
+            float(P_diag[9]), float(P_diag[10]), float(P_diag[11]),
+            # Covariance diagonal - gyro bias (3 values)
+            float(P_diag[12]), float(P_diag[13]), float(P_diag[14]),
+            # Velocity and speed (4 values)
+            float(self.x[3]), float(self.x[4]), float(self.x[5]), float(speed),
+            # Last vision correction magnitude (1 value)
+            float(self.last_vision_correction)
+        ]
+        self.pub_diag.publish(diag)
 
     def compute_ate(self):
         """

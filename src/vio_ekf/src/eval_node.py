@@ -3,6 +3,7 @@
 Evaluation Node for VIO EKF
 Computes RMSE, ATE (Absolute Trajectory Error), and NEES (Normalized Estimation Error Squared)
 between EKF estimate and ground truth, generates trajectory plots.
+Also plots filter diagnostics: biases, covariances, velocities.
 """
 import rclpy
 from rclpy.node import Node
@@ -23,6 +24,7 @@ class EvaluationNode(Node):
         # Use separate subscribers instead of time sync (more robust)
         self.sub_est = self.create_subscription(Odometry, '/vio/odom', self.est_callback, 10)
         self.sub_gt = self.create_subscription(Odometry, '/ground_truth/odom', self.gt_callback, 10)
+        self.sub_diag = self.create_subscription(Float64MultiArray, '/vio/diagnostics', self.diag_callback, 10)
 
         # Store latest messages
         self.latest_gt = None
@@ -40,6 +42,19 @@ class EvaluationNode(Node):
         self.timestamps = []
         self.time_start = None
 
+        # Diagnostics data
+        self.diag_timestamps = []
+        self.accel_bias = {'x': [], 'y': [], 'z': []}
+        self.gyro_bias = {'x': [], 'y': [], 'z': []}
+        self.P_position = {'x': [], 'y': [], 'z': []}
+        self.P_velocity = {'x': [], 'y': [], 'z': []}
+        self.P_orientation = {'x': [], 'y': [], 'z': []}
+        self.P_accel_bias = {'x': [], 'y': [], 'z': []}
+        self.P_gyro_bias = {'x': [], 'y': [], 'z': []}
+        self.velocity = {'x': [], 'y': [], 'z': []}
+        self.speed = []
+        self.vision_corrections = []
+
         # Real-time metrics
         self.ate_window = []  # Last N errors for ATE
         self.ATE_WINDOW_SIZE = 100
@@ -48,6 +63,60 @@ class EvaluationNode(Node):
         self.get_logger().info("Evaluation Node Started. Recording Data...")
         self.get_logger().info("Drive the robot around, then press Ctrl+C to save plots.")
         self.get_logger().info("=" * 50)
+
+    def diag_callback(self, msg):
+        """Process EKF diagnostics message"""
+        if len(msg.data) < 26:
+            return  # Invalid message
+
+        if self.time_start is None:
+            return  # Wait for first estimate
+
+        # Use same time reference as position data
+        import time
+        elapsed = time.time() - self.time_start if hasattr(self, '_wall_start') else len(self.diag_timestamps) * 0.02
+        if not hasattr(self, '_wall_start'):
+            self._wall_start = time.time()
+            elapsed = 0.0
+        else:
+            elapsed = time.time() - self._wall_start
+
+        self.diag_timestamps.append(elapsed)
+
+        # Parse diagnostics (see ekf_node.py publish_state for format)
+        # Biases
+        self.accel_bias['x'].append(msg.data[0])
+        self.accel_bias['y'].append(msg.data[1])
+        self.accel_bias['z'].append(msg.data[2])
+        self.gyro_bias['x'].append(msg.data[3])
+        self.gyro_bias['y'].append(msg.data[4])
+        self.gyro_bias['z'].append(msg.data[5])
+
+        # Covariances (sqrt for std dev visualization)
+        self.P_position['x'].append(np.sqrt(msg.data[6]))
+        self.P_position['y'].append(np.sqrt(msg.data[7]))
+        self.P_position['z'].append(np.sqrt(msg.data[8]))
+        self.P_velocity['x'].append(np.sqrt(msg.data[9]))
+        self.P_velocity['y'].append(np.sqrt(msg.data[10]))
+        self.P_velocity['z'].append(np.sqrt(msg.data[11]))
+        self.P_orientation['x'].append(np.sqrt(msg.data[12]))
+        self.P_orientation['y'].append(np.sqrt(msg.data[13]))
+        self.P_orientation['z'].append(np.sqrt(msg.data[14]))
+        self.P_accel_bias['x'].append(np.sqrt(msg.data[15]))
+        self.P_accel_bias['y'].append(np.sqrt(msg.data[16]))
+        self.P_accel_bias['z'].append(np.sqrt(msg.data[17]))
+        self.P_gyro_bias['x'].append(np.sqrt(msg.data[18]))
+        self.P_gyro_bias['y'].append(np.sqrt(msg.data[19]))
+        self.P_gyro_bias['z'].append(np.sqrt(msg.data[20]))
+
+        # Velocity and speed
+        self.velocity['x'].append(msg.data[21])
+        self.velocity['y'].append(msg.data[22])
+        self.velocity['z'].append(msg.data[23])
+        self.speed.append(msg.data[24])
+
+        # Vision correction
+        self.vision_corrections.append(msg.data[25])
 
     def gt_callback(self, msg):
         """Store latest ground truth for matching"""
@@ -262,6 +331,129 @@ class EvaluationNode(Node):
             plt.close()
             self.get_logger().info(f"  - {yaw_path}")
         plt.close()
+
+        # Plot 5: BIASES over time (KEY DIAGNOSTIC!)
+        if len(self.diag_timestamps) > 10:
+            fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+            # Accelerometer bias
+            axes[0].plot(self.diag_timestamps, self.accel_bias['x'], 'r-', label='ba_x', linewidth=1)
+            axes[0].plot(self.diag_timestamps, self.accel_bias['y'], 'g-', label='ba_y', linewidth=1)
+            axes[0].plot(self.diag_timestamps, self.accel_bias['z'], 'b-', label='ba_z', linewidth=1)
+            axes[0].axhline(y=0.5, color='k', linestyle='--', alpha=0.5, label='Limit ±0.5')
+            axes[0].axhline(y=-0.5, color='k', linestyle='--', alpha=0.5)
+            axes[0].set_ylabel('Accel Bias (m/s²)')
+            axes[0].set_title('Accelerometer Bias Estimates')
+            axes[0].legend()
+            axes[0].grid(True)
+
+            # Gyroscope bias
+            axes[1].plot(self.diag_timestamps, self.gyro_bias['x'], 'r-', label='bg_x', linewidth=1)
+            axes[1].plot(self.diag_timestamps, self.gyro_bias['y'], 'g-', label='bg_y', linewidth=1)
+            axes[1].plot(self.diag_timestamps, self.gyro_bias['z'], 'b-', label='bg_z', linewidth=1)
+            axes[1].axhline(y=0.1, color='k', linestyle='--', alpha=0.5, label='Limit ±0.1')
+            axes[1].axhline(y=-0.1, color='k', linestyle='--', alpha=0.5)
+            axes[1].set_ylabel('Gyro Bias (rad/s)')
+            axes[1].set_xlabel('Time (s)')
+            axes[1].set_title('Gyroscope Bias Estimates')
+            axes[1].legend()
+            axes[1].grid(True)
+
+            plt.tight_layout()
+            bias_path = os.path.join(output_dir, 'bias_plot.png')
+            plt.savefig(bias_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            self.get_logger().info(f"  - {bias_path}")
+
+        # Plot 6: COVARIANCES over time (uncertainty growth)
+        if len(self.diag_timestamps) > 10:
+            fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+
+            # Position uncertainty
+            axes[0, 0].plot(self.diag_timestamps, self.P_position['x'], 'r-', label='σ_x', linewidth=1)
+            axes[0, 0].plot(self.diag_timestamps, self.P_position['y'], 'g-', label='σ_y', linewidth=1)
+            axes[0, 0].plot(self.diag_timestamps, self.P_position['z'], 'b-', label='σ_z', linewidth=1)
+            axes[0, 0].set_ylabel('Std Dev (m)')
+            axes[0, 0].set_title('Position Uncertainty (σ)')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True)
+
+            # Velocity uncertainty
+            axes[0, 1].plot(self.diag_timestamps, self.P_velocity['x'], 'r-', label='σ_vx', linewidth=1)
+            axes[0, 1].plot(self.diag_timestamps, self.P_velocity['y'], 'g-', label='σ_vy', linewidth=1)
+            axes[0, 1].plot(self.diag_timestamps, self.P_velocity['z'], 'b-', label='σ_vz', linewidth=1)
+            axes[0, 1].set_ylabel('Std Dev (m/s)')
+            axes[0, 1].set_title('Velocity Uncertainty (σ)')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True)
+
+            # Orientation uncertainty
+            axes[1, 0].plot(self.diag_timestamps, self.P_orientation['x'], 'r-', label='σ_roll', linewidth=1)
+            axes[1, 0].plot(self.diag_timestamps, self.P_orientation['y'], 'g-', label='σ_pitch', linewidth=1)
+            axes[1, 0].plot(self.diag_timestamps, self.P_orientation['z'], 'b-', label='σ_yaw', linewidth=1)
+            axes[1, 0].set_ylabel('Std Dev (rad)')
+            axes[1, 0].set_title('Orientation Uncertainty (σ)')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True)
+
+            # Accel bias uncertainty
+            axes[1, 1].plot(self.diag_timestamps, self.P_accel_bias['x'], 'r-', label='σ_ba_x', linewidth=1)
+            axes[1, 1].plot(self.diag_timestamps, self.P_accel_bias['y'], 'g-', label='σ_ba_y', linewidth=1)
+            axes[1, 1].plot(self.diag_timestamps, self.P_accel_bias['z'], 'b-', label='σ_ba_z', linewidth=1)
+            axes[1, 1].set_ylabel('Std Dev (m/s²)')
+            axes[1, 1].set_title('Accel Bias Uncertainty (σ)')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True)
+
+            # Gyro bias uncertainty
+            axes[2, 0].plot(self.diag_timestamps, self.P_gyro_bias['x'], 'r-', label='σ_bg_x', linewidth=1)
+            axes[2, 0].plot(self.diag_timestamps, self.P_gyro_bias['y'], 'g-', label='σ_bg_y', linewidth=1)
+            axes[2, 0].plot(self.diag_timestamps, self.P_gyro_bias['z'], 'b-', label='σ_bg_z', linewidth=1)
+            axes[2, 0].set_ylabel('Std Dev (rad/s)')
+            axes[2, 0].set_xlabel('Time (s)')
+            axes[2, 0].set_title('Gyro Bias Uncertainty (σ)')
+            axes[2, 0].legend()
+            axes[2, 0].grid(True)
+
+            # Vision corrections
+            axes[2, 1].plot(self.diag_timestamps, self.vision_corrections, 'purple', label='Correction', linewidth=1)
+            axes[2, 1].set_ylabel('Correction (m)')
+            axes[2, 1].set_xlabel('Time (s)')
+            axes[2, 1].set_title('Vision Update Correction Magnitude')
+            axes[2, 1].legend()
+            axes[2, 1].grid(True)
+
+            plt.tight_layout()
+            cov_path = os.path.join(output_dir, 'covariance_plot.png')
+            plt.savefig(cov_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            self.get_logger().info(f"  - {cov_path}")
+
+        # Plot 7: VELOCITY over time
+        if len(self.diag_timestamps) > 10:
+            fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+
+            axes[0].plot(self.diag_timestamps, self.velocity['x'], 'r-', label='vx (forward)', linewidth=1)
+            axes[0].plot(self.diag_timestamps, self.velocity['y'], 'g-', label='vy (lateral)', linewidth=1)
+            axes[0].plot(self.diag_timestamps, self.velocity['z'], 'b-', label='vz (vertical)', linewidth=1)
+            axes[0].set_ylabel('Velocity (m/s)')
+            axes[0].set_title('Body-Frame Velocity Components')
+            axes[0].legend()
+            axes[0].grid(True)
+
+            axes[1].plot(self.diag_timestamps, self.speed, 'k-', linewidth=1.5)
+            axes[1].axhline(y=2.0, color='r', linestyle='--', alpha=0.5, label='Physical limit 2 m/s')
+            axes[1].set_ylabel('Speed (m/s)')
+            axes[1].set_xlabel('Time (s)')
+            axes[1].set_title('Total Speed (XY plane)')
+            axes[1].legend()
+            axes[1].grid(True)
+
+            plt.tight_layout()
+            vel_path = os.path.join(output_dir, 'velocity_plot.png')
+            plt.savefig(vel_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            self.get_logger().info(f"  - {vel_path}")
 
         self.get_logger().info(f"Plots saved to:")
         self.get_logger().info(f"  - {trajectory_path}")
