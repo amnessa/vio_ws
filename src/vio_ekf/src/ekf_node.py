@@ -721,6 +721,11 @@ class EKFNode(Node):
         a_corrected = a_m - ba  # Corrected acceleration in body frame
         w_corrected = w_m - bg  # Corrected angular velocity in body frame
 
+        # FIX: Lock ba_z to zero. For a ground robot with v_z = 0 constraint,
+        # ba_z is unobservable and perfectly coupled with gravity.
+        # If we don't lock it, the filter pushes ba_z to absorb model errors.
+        self.x[12] = 0.0  # ba_z locked to zero
+
         # ===================================================================
         # ZUPT: Zero-Velocity Update (Stationary Detection)
         # ===================================================================
@@ -1013,6 +1018,8 @@ class EKFNode(Node):
 
         # Accel bias random walk
         Qi[9:12, 9:12] = Q_accel_bias * dt
+        # FIX: Lock ba_z covariance to zero (unobservable for ground robot)
+        Qi[11, 11] = 0.0
 
         # Velocity-Accel bias cross-correlation
         Qi[3:6, 9:12] = -Q_accel_bias * (dt**2 / 2.0)
@@ -1222,7 +1229,7 @@ class EKFNode(Node):
                 lm_id = obs.get('id', -1)
 
                 # --- First-Estimate Jacobians (FEJ) for orientation part ---
-                # Store first estimate for new landmarks
+                # Store first estimate for new landmarks (for logging only now)
                 if lm_id not in self.landmark_first_estimates:
                     self.landmark_first_estimates[lm_id] = {
                         'p': p_w.copy(),
@@ -1231,8 +1238,10 @@ class EKFNode(Node):
                     if iteration == 0:
                         self.get_logger().info(f"FEJ: First observation of LM{int(lm_id)}, storing pose")
 
-                # Use FEJ rotation for position Jacobian (prevents yaw observability issues)
-                R_fej = self.landmark_first_estimates[lm_id]['R']
+                # FIX: Use CURRENT rotation for Jacobian, not FEJ
+                # FEJ causes divergence when current yaw deviates from first-yaw:
+                # the Jacobian no longer points in the correct gradient direction
+                # R_fej = self.landmark_first_estimates[lm_id]['R']  # DISABLED
 
                 # Transform World -> Body using CURRENT iteration state
                 p_b = R_wb.T @ (lm_pos_world - p_w)
@@ -1280,8 +1289,8 @@ class EKFNode(Node):
                     [0, fy/Z, -fy*Y/Z**2]
                 ])
 
-                # Jacobian w.r.t Position (use FEJ rotation)
-                J_pos = -self.R_b_c @ R_fej.T
+                # Jacobian w.r.t Position (use CURRENT rotation, not FEJ)
+                J_pos = -self.R_b_c @ R_wb.T
 
                 # Assemble H (2x15) for this landmark - POSITION ONLY
                 H = np.zeros((2, 15))
@@ -1545,42 +1554,64 @@ class EKFNode(Node):
         self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ (np.eye(2) * self.R_cam) @ K.T
 
         # 4. Inject Error into Nominal State
-        # CRITICAL FIX: Since H[:,6:9] = 0 (vision doesn't observe orientation),
-        # any non-zero dx[6:9] comes from P cross-correlations, NOT from actual
-        # orientation observability. Zero out phantom corrections.
-        dx[6:9] = 0.0    # orientation - not observed by vision
-        dx[9:12] = 0.0   # accel bias - not observed by vision
-        dx[12:15] = 0.0  # gyro bias - not observed by vision
+        # FIX: Do NOT zero out dx components!
+        # The P matrix contains cross-correlations. When vision corrects position,
+        # the correlations in P allow orientation/bias to also be corrected.
+        # Zeroing dx breaks covariance consistency and leaves errors untouched.
+        # Trust the Kalman gain K computed from P.
 
-        # Position correction
+        # Position correction (with limit for safety)
         pos_correction = dx[0:3]
         pos_corr_norm = np.linalg.norm(pos_correction)
-        if pos_corr_norm > 0.5:  # Limit per-update correction
+        if pos_corr_norm > 0.5:
             pos_correction = pos_correction * (0.5 / pos_corr_norm)
             self.get_logger().warn(f"Position correction clipped: {pos_corr_norm:.2f}m", throttle_duration_sec=1.0)
         self.x[0:3] += pos_correction
 
-        # Velocity correction
+        # Velocity correction (with limit for safety)
         vel_correction = dx[3:6]
         vel_corr_norm = np.linalg.norm(vel_correction)
-        if vel_corr_norm > 0.3:  # Conservative limit
+        if vel_corr_norm > 0.3:
             vel_correction = vel_correction * (0.3 / vel_corr_norm)
             self.get_logger().warn(f"Velocity correction clipped: {vel_corr_norm:.2f}m/s", throttle_duration_sec=1.0)
         self.x[3:6] += vel_correction
 
-        # Biases - NOT updated from vision (set to zero above)
+        # Orientation correction (from cross-correlations) - apply as axis-angle
+        ori_correction = dx[6:9]
+        ori_corr_norm = np.linalg.norm(ori_correction)
+        if ori_corr_norm > 0.05:  # Limit to ~3 degrees per update
+            ori_correction = ori_correction * (0.05 / ori_corr_norm)
+        if ori_corr_norm > 1e-8:
+            q = self.x[6:10]
+            delta_q = R.from_rotvec(ori_correction)
+            q_updated = (R.from_quat([q[1], q[2], q[3], q[0]]) * delta_q).as_quat()
+            self.x[6:10] = np.array([q_updated[3], q_updated[0], q_updated[1], q_updated[2]])
 
-        # Enforce bias magnitude limits (physical bounds, not rate limits)
-        MAX_ACCEL_BIAS = 0.5  # m/s² - realistic MEMS limit
-        MAX_GYRO_BIAS = 0.1   # rad/s - realistic MEMS limit
+        # Bias corrections (from cross-correlations) - with limits
+        bias_correction = dx[9:12]
+        if np.linalg.norm(bias_correction) > 0.01:  # Limit accel bias change
+            bias_correction = bias_correction * (0.01 / np.linalg.norm(bias_correction))
+        self.x[10:13] += bias_correction
+
+        gyro_bias_correction = dx[12:15]
+        if np.linalg.norm(gyro_bias_correction) > 0.005:  # Limit gyro bias change
+            gyro_bias_correction = gyro_bias_correction * (0.005 / np.linalg.norm(gyro_bias_correction))
+        self.x[13:16] += gyro_bias_correction
+
+        # Enforce bias magnitude limits (physical bounds)
+        MAX_ACCEL_BIAS = 0.5  # m/s²
+        MAX_GYRO_BIAS = 0.1   # rad/s
         self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
         self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
+        self.x[12] = 0.0  # Keep ba_z locked
 
         # --- GROUND ROBOT CONSTRAINTS (post-update) ---
         # Per recommendation2.md: When zeroing state, also zero corresponding covariance
         # to prevent P mismatch (state forbidden to move but covariance grows)
         self.x[2] = 0.0  # Z position = 0
         self.x[5] = 0.0  # Z velocity = 0
+        self.x[12] = 0.0  # ba_z = 0 (unobservable)
+
         # Zero out Z covariance rows/columns to match state constraint
         self.P[2, :] = 0.0
         self.P[:, 2] = 0.0
@@ -1588,6 +1619,10 @@ class EKFNode(Node):
         self.P[5, :] = 0.0
         self.P[:, 5] = 0.0
         self.P[5, 5] = 1e-6
+        # Also lock ba_z covariance
+        self.P[11, :] = 0.0
+        self.P[:, 11] = 0.0
+        self.P[11, 11] = 1e-6
 
         # Final velocity sanity check - CONSERVATIVE for TurtleBot
         MAX_SPEED = 0.5  # Reduced from 2.0 - TurtleBot max is ~0.26 m/s
