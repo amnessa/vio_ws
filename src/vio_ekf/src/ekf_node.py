@@ -76,8 +76,8 @@ class EKFNode(Node):
 
         # Noise Parameters - Tuned for Gazebo simulation
         # Higher values = trust IMU less, allow more vision correction
-        self.sigma_a = 0.5      # Accel noise stddev (m/s^2) - higher for Gazebo
-        self.sigma_g = 0.05     # Gyro noise stddev (rad/s) - accounts for simulation noise
+        self.sigma_a = 1.0      # Accel noise stddev (m/s^2) - higher for Gazebo
+        self.sigma_g = 0.5     # Gyro noise stddev (rad/s) - accounts for simulation noise
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
         # Per recommendation2.md: Tune bias random walk carefully.
@@ -85,7 +85,7 @@ class EKFNode(Node):
         # Reduced from 5e-4 to allow slower, more stable bias estimation.
         self.Q_ba = 1e-4  # Accel bias random walk - slower adaptation
         self.Q_bg = 1e-5  # Gyro bias random walk - slower adaptation
-        self.R_cam = 25.0   # Pixel measurement noise - INCREASED to trust vision less (prevents velocity explosion)
+        self.R_cam = 70.0   # Pixel measurement noise - INCREASED to trust vision less (prevents velocity explosion)
 
         # ZUPT (Zero-Velocity Update) parameters
         # Per recommend.md Section 5: Trigger ZUPT based solely on gyro activity
@@ -109,7 +109,7 @@ class EKFNode(Node):
         # Outlier rejection settings
         self.mahalanobis_threshold = 60.0  # Very relaxed - accept most measurements
         self.consecutive_outliers = 0
-        self.max_consecutive_outliers = 3  # Quick recovery after just 3 rejections
+        self.max_consecutive_outliers = 5  # Quick recovery after just 3 rejections
 
         # Gravity correction gain (for attitude correction from accelerometer)
         # Higher values = faster convergence but more noise sensitivity
@@ -1169,7 +1169,7 @@ class EKFNode(Node):
             P_prior = self.P.copy()
 
         # IEKF iteration parameters
-        MAX_ITERATIONS = 10
+        MAX_ITERATIONS = 4
         CONVERGENCE_THRESHOLD = 0.01  # meters for position, radians for orientation
 
         # Working state for iterations (start from current estimate)
@@ -1222,13 +1222,13 @@ class EKFNode(Node):
                 # Residual
                 z_res = np.array([u_meas - u_pred, v_meas - v_pred])
 
-                # GATE large residuals - reject observations with > 100px error
+                # GATE large residuals - reject observations with > 150px error
                 # These indicate wrong data association or severely wrong state estimate
                 residual_norm = np.linalg.norm(z_res)
-                if residual_norm > 100.0:
+                if residual_norm > 150.0:
                     if iteration == 0:
                         self.get_logger().warn(
-                            f"  LM{int(lm_id)}: REJECTED (res={residual_norm:.0f}px > 100px gate)",
+                            f"  LM{int(lm_id)}: REJECTED (res={residual_norm:.0f}px > 150px gate)",
                             throttle_duration_sec=0.5
                         )
                     continue  # Skip this observation
@@ -1294,13 +1294,13 @@ class EKFNode(Node):
             # Compute state correction
             dx = K @ z_res_all
 
-            # CRITICAL: Vision observes POSITION ONLY.
-            # Zero out all other corrections - they come from P cross-correlations,
-            # NOT from actual observability. Allowing these phantom corrections
-            # corrupts orientation → gravity cancellation fails → divergence.
-            dx[3:6] = 0.0   # Velocity - not directly observed
-            dx[6:9] = 0.0   # Orientation - not observed
-            dx[9:15] = 0.0  # Biases - not observed
+            # # CRITICAL: Vision observes POSITION ONLY.
+            # # Zero out all other corrections - they come from P cross-correlations,
+            # # NOT from actual observability. Allowing these phantom corrections
+            # # corrupts orientation → gravity cancellation fails → divergence.
+            # dx[3:6] = 0.0   # Velocity - not directly observed
+            # dx[6:9] = 0.0   # Orientation - not observed
+            # dx[9:15] = 0.0  # Biases - not observed
 
             # Apply correction to iteration state (position only now)
             x_iter[0:3] += dx[0:3]  # Position
@@ -1343,14 +1343,16 @@ class EKFNode(Node):
         self.x[0:3] = x_iter[0:3]
         # Velocity and orientation unchanged (vision doesn't observe them directly)
 
-        # Update covariance - but ONLY for position states
-        # Zero out K rows for unobserved states to prevent false certainty
-        K_masked = K.copy()
-        K_masked[3:, :] = 0.0  # Zero velocity, orientation, bias rows
+        # # Update covariance - but ONLY for position states
+        # # Zero out K rows for unobserved states to prevent false certainty
+        # K_masked = K.copy()
+        # K_masked[3:, :] = 0.0  # Zero velocity, orientation, bias rows
 
         I = np.eye(15)
-        IKH = I - K_masked @ H_all
-        self.P = IKH @ P_prior @ IKH.T + K_masked @ R_all @ K_masked.T
+        # IKH = I - K_masked @ H_all
+        IKH = I - K @ H_all
+        # self.P = IKH @ P_prior @ IKH.T + K_masked @ R_all @ K_masked.T
+        self.P = IKH @ P_prior @ IKH.T + K @ R_all @ K.T
         self.P = 0.5 * (self.P + self.P.T)
         min_eig = np.min(np.diag(self.P))
         if min_eig < 1e-10:
@@ -1370,7 +1372,7 @@ class EKFNode(Node):
         self.P[5, 5] = max(self.P[5, 5], 1e-4)
 
         # Velocity sanity check
-        MAX_SPEED = 0.5
+        MAX_SPEED = 1.0
         speed = np.linalg.norm(self.x[3:5])
         if speed > MAX_SPEED:
             self.x[3:5] = self.x[3:5] * (MAX_SPEED / speed)
