@@ -22,10 +22,11 @@ ekf_node:
     # FILTER MODE SWITCHES
     # ==========================================================================
     # Enable/disable prediction step (IMU propagation)
-    enable_prediction: true
+    # When false, uses synthetic "frozen" prediction instead (see below)
+    enable_prediction: false
 
     # Enable/disable correction step (camera measurement updates)
-    enable_correction: false
+    enable_correction: true
 
     # Enable/disable ZUPT (Zero-Velocity Update when stationary)
     enable_zupt: false
@@ -33,6 +34,18 @@ ekf_node:
     # Enable/disable IMU lever-arm compensation
     # Compensates for centripetal acceleration when IMU is offset from body origin
     enable_imu_lever_arm: true
+
+    # ==========================================================================
+    # SYNTHETIC PREDICTION (for measurement-only testing)
+    # ==========================================================================
+    # When enable_prediction=false, the filter uses these frozen values instead
+    # of IMU measurements. This keeps the filter alive (P healthy) while
+    # ignoring IMU noise, allowing you to test vision in isolation.
+    #
+    # Set synthetic_velocity=0 to test stationary vision updates
+    # Set synthetic_velocity>0 to simulate constant forward motion
+    synthetic_velocity: 0.5    # m/s, frozen forward velocity
+    synthetic_omega: 0.2       # rad/s, frozen yaw rate
 
     # ==========================================================================
     # PROCESS NOISE (Q) - IMU Model Trust

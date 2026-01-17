@@ -71,6 +71,10 @@ class EKFNode(Node):
         self.declare_parameter('imu_downsample_factor', 4)
         self.declare_parameter('max_time_delay', 0.15)
 
+        # Synthetic prediction parameters (for measurement-only testing)
+        self.declare_parameter('synthetic_velocity', 0.0)  # m/s, frozen forward velocity
+        self.declare_parameter('synthetic_omega', 0.0)     # rad/s, frozen yaw rate
+
         # =======================================================================
         # READ PARAMETERS
         # =======================================================================
@@ -78,15 +82,21 @@ class EKFNode(Node):
         self.enable_correction = self.get_parameter('enable_correction').value
         self.enable_zupt = self.get_parameter('enable_zupt').value
 
+        # Synthetic prediction parameters
+        self.synthetic_velocity = self.get_parameter('synthetic_velocity').value
+        self.synthetic_omega = self.get_parameter('synthetic_omega').value
+
         # Log filter mode
         mode_str = []
         if self.enable_prediction:
-            mode_str.append("PREDICTION")
+            mode_str.append("PREDICTION(IMU)")
+        else:
+            mode_str.append(f"PREDICTION(SYNTHETIC v={self.synthetic_velocity:.2f}m/s, ω={self.synthetic_omega:.2f}rad/s)")
         if self.enable_correction:
             mode_str.append("CORRECTION")
         if self.enable_zupt:
             mode_str.append("ZUPT")
-        self.get_logger().info(f"=== FILTER MODE: {' + '.join(mode_str) if mode_str else 'DISABLED'} ===")
+        self.get_logger().info(f"=== FILTER MODE: {' + '.join(mode_str)} ===")
 
         # --- Initialization Phase ---
         # Collect IMU samples while stationary to estimate biases and initial orientation
@@ -375,9 +385,15 @@ class EKFNode(Node):
         self.imu_buffer.clear()
         self.imu_accumulated_dt = 0.0
 
-        # --- PREDICTION STEP with averaged IMU data ---
+        # --- PREDICTION STEP ---
         if self.enable_prediction:
+            # Normal IMU-based prediction
             self.predict(batch_dt, avg_accel, avg_gyro)
+        else:
+            # Synthetic "frozen" prediction for measurement-only testing
+            # This keeps the filter alive (P stays healthy) while ignoring IMU noise
+            self.predict_synthetic(batch_dt, self.synthetic_velocity, self.synthetic_omega)
+
         self.publish_state(msg.header.stamp)
 
     def initialize_from_imu(self):
@@ -786,6 +802,122 @@ class EKFNode(Node):
                 f"ZUPT Gravity: Tilt corrected by {np.degrees(rot_corr_norm):.2f} deg",
                 throttle_duration_sec=1.0
             )
+
+    def predict_synthetic(self, dt, fixed_vx, fixed_omega_z):
+        """
+        Synthetic "Frozen" Prediction for Measurement-Only Testing.
+
+        When enable_prediction=false, we can't just skip prediction entirely because:
+        1. Prediction adds uncertainty (Q), Measurement removes uncertainty (R)
+        2. Without prediction, covariance P shrinks to zero ("infinite confidence")
+        3. Filter stops listening to new measurements ("falls asleep")
+
+        This function propagates the state using a "frozen" constant velocity model:
+        - Ignores actual IMU measurements (no sensor noise)
+        - Uses configurable fixed velocity and yaw rate
+        - Maintains healthy covariance with synthetic process noise
+
+        This allows testing the measurement update in isolation.
+
+        Args:
+            dt: Time step
+            fixed_vx: Frozen forward velocity in body frame (m/s)
+            fixed_omega_z: Frozen yaw rate (rad/s)
+        """
+        # ===================================================================
+        # STEP 1: Nominal State Propagation (Perfect Frozen Model)
+        # ===================================================================
+
+        # Current state
+        p = self.x[0:3]
+        q = self.x[6:10]
+
+        # Frozen velocity and angular velocity
+        v_b = np.array([fixed_vx, 0.0, 0.0])  # Forward only
+        w_b = np.array([0.0, 0.0, fixed_omega_z])  # Yaw only
+
+        # Rotation matrix (body to world)
+        rot = R.from_quat([q[1], q[2], q[3], q[0]])  # scipy uses [x, y, z, w]
+        R_wb = rot.as_matrix()
+
+        # Position update: p_new = p + R_wb @ v_b * dt
+        self.x[0:3] = p + (R_wb @ v_b) * dt
+
+        # Velocity update: Force body velocity to frozen value
+        self.x[3:6] = v_b
+
+        # Orientation update: integrate angular velocity
+        if abs(fixed_omega_z) > 1e-6:
+            # Quaternion integration for yaw rotation
+            angle = fixed_omega_z * dt
+            dq = R.from_rotvec([0, 0, angle])
+            new_rot = rot * dq
+            q_new = new_rot.as_quat()  # [x, y, z, w]
+            self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
+
+        # Biases: Freeze (no change)
+        # self.x[10:16] unchanged
+
+        # ===================================================================
+        # STEP 2: Error Covariance Propagation (Frozen Jacobian)
+        # ===================================================================
+        # Build Jacobian F assuming frozen conditions:
+        # - w = [0, 0, omega_z]
+        # - a = 0 (no acceleration, constant velocity)
+        # - v_b = [fixed_vx, 0, 0]
+
+        F = np.zeros((15, 15))
+
+        # Position-Velocity coupling: d(δp)/d(δv) = R_wb * dt
+        F[0:3, 3:6] = R_wb * dt
+
+        # Position-Orientation coupling: d(δp)/d(δθ) = -[R_wb @ v_b]_× * dt
+        # This is the "frozen speed" part crucial for observability
+        v_world = R_wb @ v_b
+        F[0:3, 6:9] = -skew_symmetric(v_world) * dt
+
+        # Orientation-Gyro bias coupling (minimal since we freeze w)
+        # F[6:9, 12:15] = -R_wb * dt  # Commented: we're using frozen w, not measured
+
+        # State transition matrix
+        Fx = np.eye(15) + F
+
+        # ===================================================================
+        # STEP 3: Synthetic Process Noise
+        # ===================================================================
+        # We must add SOME noise or P collapses to zero.
+        # Use small Q since the model is "perfect" (no IMU noise).
+
+        Q_synthetic = np.zeros((15, 15))
+
+        # Position: small uncertainty from velocity model
+        Q_synthetic[0:3, 0:3] = np.eye(3) * (0.01 * dt) ** 2  # 1 cm/s position noise
+
+        # Velocity: small uncertainty (frozen but not perfect)
+        Q_synthetic[3:6, 3:6] = np.eye(3) * (0.05 * dt) ** 2  # 5 cm/s velocity noise
+
+        # Orientation: small uncertainty from yaw rate model
+        Q_synthetic[6:9, 6:9] = np.eye(3) * (0.001 * dt) ** 2  # ~0.06 deg/s orientation noise
+
+        # Biases: very small random walk (essentially frozen)
+        Q_synthetic[9:12, 9:12] = np.eye(3) * (1e-5 * dt)   # Accel bias
+        Q_synthetic[12:15, 12:15] = np.eye(3) * (1e-6 * dt)  # Gyro bias
+
+        # ===================================================================
+        # STEP 4: Covariance Update
+        # ===================================================================
+        self.P = Fx @ self.P @ Fx.T + Q_synthetic
+        self.P = 0.5 * (self.P + self.P.T)  # Ensure symmetry
+
+        # Store state in buffer for time delay compensation
+        if self.last_imu_time is not None:
+            self.state_buffer.append({
+                'time': self.last_imu_time,
+                'x': self.x.copy(),
+                'P': self.P.copy()
+            })
+            if len(self.state_buffer) > self.state_buffer_size:
+                self.state_buffer.pop(0)
 
     def predict(self, dt, a_m, w_m):
         """
