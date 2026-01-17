@@ -1,291 +1,383 @@
-# VIO ES-EKF Project Documentation
+# VIO EKF Project Documentation
 
-## Overview
+## Visual-Inertial Odometry using Error-State Extended Kalman Filter
 
-This project implements a **Visual-Inertial Odometry (VIO)** system using an **Error-State Extended Kalman Filter (ES-EKF)** for a TurtleBot3 ground robot in Gazebo simulation. The filter fuses high-rate IMU data (200Hz) with camera-based ArUco marker observations to estimate the robot's pose, velocity, and sensor biases.
-
-### Key Design Decisions
-
-1. **Robocentric Formulation**: Velocity is expressed in body frame (`v_b`) rather than world frame to decouple observable states from unobservable global yaw.
-2. **Error-State (MEKF) Approach**: Uses minimal 15D error state for orientation (rotation vector) while maintaining full 16D nominal state with quaternion.
-3. **Iterated EKF (IEKF)**: Vision updates use Gauss-Newton iterations to handle large residuals.
-4. **Position-Only Vision Updates**: Only position is directly observed; orientation/velocity corrections come through covariance cross-correlations.
+This project implements a Visual-Inertial Odometry (VIO) system using an Error-State Extended Kalman Filter (ES-EKF) for robot localization. The system fuses IMU measurements with ArUco marker observations to estimate robot pose in real-time.
 
 ---
 
-## File Structure
+## Table of Contents
 
-```
-src/vio_ekf/
-├── src/
-│   ├── ekf_node.py          # Main ES-EKF implementation
-│   ├── eval_node.py         # Evaluation and plotting node
-│   ├── vision_node.py       # ArUco marker detection
-│   └── pose_tf_broadcaster.cpp  # TF frame broadcaster
-├── config/                   # Gazebo sensor configurations
-├── launch/                   # ROS2 launch files
-├── models/                   # Gazebo world models
-├── rviz/                     # RViz configurations
-├── urdf/                     # Robot URDF descriptions
-└── worlds/                   # Gazebo world files
-```
+1. [Project Overview](#project-overview)
+2. [Architecture](#architecture)
+3. [Files and Components](#files-and-components)
+4. [EKF Node (ekf_node.py)](#ekf-node-ekf_nodepy)
+5. [Vision Node (vision_node.py)](#vision-node-vision_nodepy)
+6. [Evaluation Node (eval_node.py)](#evaluation-node-eval_nodepy)
+7. [Ground Truth Broadcaster (pose_tf_broadcaster.cpp)](#ground-truth-broadcaster-pose_tf_broadcastercpp)
+8. [Configuration Parameters](#configuration-parameters)
+9. [Launch System](#launch-system)
+10. [ROS2 Topics](#ros2-topics)
+11. [Coordinate Frames](#coordinate-frames)
+12. [Filter Modes](#filter-modes)
 
 ---
 
-## Core Classes and Functions
+## Project Overview
 
-### 1. EKFNode (`ekf_node.py`)
+### Purpose
+Estimate 6-DOF robot pose (position and orientation) by fusing:
+- **IMU**: High-rate (200Hz) inertial measurements for motion prediction
+- **Camera**: Lower-rate (~30Hz) ArUco marker observations for drift correction
 
-The main ROS2 node implementing the Error-State Extended Kalman Filter.
-
-#### State Representation
-
-```
-Nominal State (16D): [p_w(3), v_b(3), q(4), ba(3), bg(3)]
-  - p_w:  Position in WORLD frame (meters)
-  - v_b:  Velocity in BODY frame (robocentric formulation)
-  - q:    Quaternion [w, x, y, z] (world to body orientation)
-  - ba:   Accelerometer bias (m/s²)
-  - bg:   Gyroscope bias (rad/s)
-
-Error State (15D): [δp(3), δv(3), δθ(3), δba(3), δbg(3)]
-  - δθ:   Rotation vector (minimal representation)
-```
-
-#### Constructor `__init__(self)`
-
-Initializes the EKF node with:
-- State vector `self.x` (16D) and covariance `self.P` (15×15)
-- Noise parameters: `sigma_a`, `sigma_g`, `Q_ba`, `Q_bg`, `R_cam`
-- ZUPT parameters for zero-velocity updates
-- IMU downsampling buffer (200Hz → 50Hz)
-- ArUco landmark map (24 markers in circular arrangement at 2.5m radius)
-- Camera intrinsics and extrinsics (`K`, `R_b_c`, `t_b_c`)
-- ROS2 subscribers and publishers
-
-#### Key Methods
-
-| Method | Description |
-|--------|-------------|
-| `predict(dt, a_m, w_m)` | IMU odometry prediction step (see below) |
-| `batch_update(observations)` | IEKF vision update with multiple landmarks |
-| `update(lm_pos_world, u_meas, v_meas)` | Single landmark EKF update (legacy) |
-| `_zupt_velocity_update()` | Formal EKF update to zero velocity when stationary |
-| `_zupt_gravity_update(a_corrected)` | Gravity-based tilt correction when stationary |
-| `_reinitialize_orientation(a_m, w_m)` | Recovery from filter divergence |
-| `initialize_from_imu()` | Initial orientation estimation from gravity |
-| `publish_state(timestamp)` | Publish odometry, path, and diagnostics |
-| `compute_ate()` | Calculate Absolute Trajectory Error |
-| `compute_nees()` | Calculate Normalized Estimation Error Squared |
+### Key Features
+- **Robocentric Formulation**: Velocity expressed in body frame to decouple observable states from unobservable global yaw
+- **Error-State EKF**: Efficient quaternion-based orientation with minimal parameterization
+- **ZUPT**: Zero-Velocity Update for stationary periods
+- **Outlier Rejection**: Mahalanobis distance-based measurement gating
+- **Time Delay Compensation**: State buffer for matching vision measurements with IMU state
 
 ---
 
-### Prediction Step (`predict`)
-
-The prediction step implements body-frame velocity dynamics:
+## Architecture
 
 ```
-Position:    p_w_dot = R_wb @ v_b
-Velocity:    v_b_dot = a_corrected - g_body - ω × v_b
-Orientation: q_dot = 0.5 * q ⊗ [0, ω_corrected]
-```
-
-**Key Implementation Details:**
-
-1. **IMU Downsampling**: 200Hz → 50Hz by averaging every 4 samples
-   ```python
-   self.imu_buffer.append({'accel': a_m, 'gyro': w_m})
-   if len(self.imu_buffer) >= self.imu_downsample_factor:
-       a_avg = np.mean([s['accel'] for s in self.imu_buffer], axis=0)
-       w_avg = np.mean([s['gyro'] for s in self.imu_buffer], axis=0)
-   ```
-
-2. **Gravity Compensation**: Subtract gravity in body frame
-   ```python
-   g_body = R_wb.T @ self.g  # Gravity in body frame
-   acc_body = a_corrected - g_body - coriolis  # SUBTRACT gravity
-   ```
-
-3. **ba_z Lock**: Z-accelerometer bias locked to zero (unobservable for ground robot)
-   ```python
-   self.x[12] = 0.0  # ba_z locked to zero
-   ```
-
-4. **Ground Constraints**:
-   - Z-position = 0
-   - Z-velocity = 0
-   - Roll/pitch clamped to ±10°
-
-5. **Error-State Jacobians** (Discrete-time F matrix):
-   ```
-   F = I + Fc * dt where Fc is the continuous-time Jacobian
-
-   Fc structure (15×15):
-   - dp/dv:  R_wb (body velocity to world position)
-   - dv/dθ:  skew(a_corrected - g_body)
-   - dv/dba: -I
-   - dθ/dθ:  -skew(ω)
-   - dθ/dbg: -I
-   ```
-
----
-
-### Vision Update (`batch_update`)
-
-Implements Iterated EKF (IEKF) for robust convergence with large residuals.
-
-**Algorithm:**
-1. For each iteration (up to 4):
-   - Linearize measurement model at current estimate
-   - Compute stacked residual and Jacobian for all landmarks
-   - Apply per-observation gate (reject if residual > 100px)
-   - Compute Kalman gain using PRIOR covariance
-   - Update state estimate
-   - Check convergence
-
-**Measurement Model:**
-```
-h(x) = π(R_bc @ (R_wb^T @ (lm_world - p_w) - t_bc))
-
-where π is the pinhole projection:
-  u = fx * X/Z + cx
-  v = fy * Y/Z + cy
-```
-
-**Position-Only Jacobian:**
-```python
-H = np.zeros((2, 15))
-H[:, 0:3] = J_proj @ (-R_bc @ R_wb.T)  # Only position columns
-```
-
-**Covariance Update (Joseph Form):**
-```python
-IKH = I - K @ H
-P = IKH @ P @ IKH.T + K @ R @ K.T  # Numerically stable
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Gazebo Sim     │     │  ROS2 Bridge    │     │   ROS2 Nodes    │
+├─────────────────┤     ├─────────────────┤     ├─────────────────┤
+│ - IMU sensor    │────▶│ /imu            │────▶│  EKF Node       │
+│ - Camera sensor │────▶│ /camera         │────▶│  Vision Node    │
+│ - Diff drive    │◀────│ /cmd_vel        │◀────│  (detects       │
+│ - Ground truth  │────▶│ /ground_truth   │     │   ArUco)        │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+                                                        │
+                                                        ▼
+                                                ┌─────────────────┐
+                                                │  Outputs        │
+                                                │ - /vio/odom     │
+                                                │ - /vio/path     │
+                                                │ - TF transforms │
+                                                └─────────────────┘
 ```
 
 ---
 
-### ZUPT (Zero-Velocity Update)
+## Files and Components
 
-Two-part update when robot is stationary:
+### Source Files (`src/vio_ekf/src/`)
 
-#### `_zupt_velocity_update()`
-Formal EKF update with measurement z = [0, 0, 0] (zero velocity):
-```python
-H = [0, 0, 0 | I_3×3 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0]  # Selects velocity
-K = P @ H.T @ inv(H @ P @ H.T + R_zupt)
-dx = K @ (0 - v_b)
-```
+| File | Language | Description |
+|------|----------|-------------|
+| `ekf_node.py` | Python | Main EKF filter - prediction and correction steps |
+| `vision_node.py` | Python | ArUco marker detection and pixel coordinate extraction |
+| `eval_node.py` | Python | Trajectory evaluation - computes RMSE, ATE, generates plots |
+| `pose_tf_broadcaster.cpp` | C++ | Extracts ground truth pose from Gazebo and publishes to ROS2 |
 
-#### `_zupt_gravity_update(a_corrected)`
-Treats accelerometer as tilt sensor:
-```python
-a_expected = R_wb.T @ g_world  # What accel should read if aligned
-z_res = a_measured - a_expected
-# Jacobian: d(R^T @ g)/dθ = -skew(a_expected)
-```
+### Configuration (`src/vio_ekf/config/`)
 
-**Stationary Detection:**
-- Gyro norm < 0.02 rad/s for 0.25 seconds
-- Vision motion cooldown not active (no recent position correction > 2cm)
+| File | Description |
+|------|-------------|
+| `ekf_params.yaml` | Main EKF tuning parameters (process noise, measurement noise, modes) |
+| `imu.yaml` | IMU sensor configuration for Gazebo bridge |
+| `camera.yaml` | Camera sensor configuration for Gazebo bridge |
+| `diff_drive.yaml` | Differential drive controller configuration |
 
----
+### Launch (`src/vio_ekf/launch/`)
 
-### Helper Functions
+| File | Description |
+|------|-------------|
+| `vio_ekf.launch.py` | Main launch file - starts Gazebo, bridges, all nodes, RViz |
 
-#### `skew_symmetric(v)`
-Computes the skew-symmetric (cross-product) matrix:
-```python
-def skew_symmetric(v):
-    return np.array([
-        [0, -v[2], v[1]],
-        [v[2], 0, -v[0]],
-        [-v[1], v[0], 0]
-    ])
-```
+### Scripts (`src/vio_ekf/scripts/`)
 
-#### `quat_to_rotation_matrix(q)`
-Converts quaternion [w, x, y, z] to 3×3 rotation matrix:
-```python
-def quat_to_rotation_matrix(q):
-    w, x, y, z = q
-    return np.array([
-        [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
-        [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
-        [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
-    ])
-```
+| File | Description |
+|------|-------------|
+| `generate_aruco_simulation.py` | Generates ArUco marker models for Gazebo world |
 
 ---
 
-### 2. VisionNode (`vision_node.py`)
+## EKF Node (ekf_node.py)
 
-ArUco marker detection node using OpenCV.
+The core filter implementation using Error-State Extended Kalman Filter.
 
-#### Class: `VisionNode`
+### Class: `EKFNode`
 
-| Method | Description |
-|--------|-------------|
-| `__init__()` | Initializes ArUco detector (DICT_4X4_50), CLAHE for contrast enhancement |
-| `image_callback(msg)` | Detects markers, publishes pixel coordinates and IDs |
+#### State Vector (16 elements)
+```
+x = [p_w(3), v_b(3), q(4), ba(3), bg(3)]
+     ├── Position in WORLD frame (for visualization)
+     ├── Velocity in BODY frame (robocentric - decoupled from yaw)
+     ├── Quaternion [w, x, y, z] (world to body rotation)
+     ├── Accelerometer bias (body frame)
+     └── Gyroscope bias (body frame)
+```
 
-**Detection Pipeline:**
-1. Convert image to grayscale
-2. Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-3. Detect ArUco markers with subpixel corner refinement
-4. Extract marker centers (average of 4 corners)
-5. Publish as `PoseArray` with: `x=u, y=v, z=marker_id`
+#### Error State Vector (15 elements)
+```
+δx = [δp(3), δv(3), δθ(3), δba(3), δbg(3)]
+```
 
-**ArUco Parameters (Aggressive for Simulation):**
-```python
-cornerRefinementMethod = CORNER_REFINE_SUBPIX
-minMarkerPerimeterRate = 0.005  # Detect tiny markers
-maxMarkerPerimeterRate = 8.0    # And very large ones
-errorCorrectionRate = 1.0       # Maximum error correction
+### Key Methods
+
+#### `__init__(self)`
+Initializes the EKF node:
+- Declares and reads ROS2 parameters
+- Initializes state vector `x` and covariance matrix `P`
+- Sets up subscribers (IMU, camera, ground truth) and publishers
+- Configures IMU and camera extrinsics
+- Loads ArUco marker map (24 markers in circular pattern)
+
+#### `imu_callback(self, msg)`
+Handles incoming IMU messages at 200Hz:
+1. Transforms IMU readings from IMU frame to body frame
+2. Applies lever-arm compensation for IMU offset
+3. During initialization: collects samples for bias estimation
+4. After initialization:
+   - Downsamples IMU (4:1 averaging → 50Hz)
+   - Calls `predict()` or `predict_synthetic()` depending on mode
+   - Publishes cmd_vel in synthetic mode
+
+#### `predict(self, dt, a_m, w_m)`
+ES-EKF prediction step using IMU measurements:
+1. **Bias Correction**: Subtracts estimated biases from measurements
+2. **ZUPT Detection**: Checks gyro for stationary periods
+3. **Nominal State Propagation**:
+   - Computes body-frame acceleration: `acc = a_m - ba - R^T·g - ω×v`
+   - Updates velocity: `v_new = v + acc·dt`
+   - Updates position: `p_new = p + R·v·dt`
+   - Updates orientation via quaternion integration
+4. **Covariance Propagation**: `P = F·P·F^T + Q`
+
+#### `predict_synthetic(self, dt, fixed_vx, fixed_omega_z)`
+Synthetic "frozen" prediction for measurement-only testing:
+- Ignores actual IMU measurements
+- Uses configurable constant velocity and yaw rate
+- Maintains healthy covariance with synthetic process noise
+- Publishes matching cmd_vel to move the robot
+
+#### `vision_callback(self, msg)`
+Handles ArUco marker observations:
+1. Matches vision timestamp to buffered IMU state
+2. Collects valid landmark observations
+3. Requires 2+ markers for observability
+4. Calls `batch_update()` for measurement update
+
+#### `batch_update(self, observations, buffered_state)`
+Iterated EKF (IEKF) measurement update:
+1. Projects landmarks from world → body → camera → pixels
+2. Computes residuals (measured - predicted pixels)
+3. Rejects outliers (>100px error)
+4. Builds stacked Jacobian H and measurement matrix
+5. Computes Kalman gain: `K = P·H^T·(H·P·H^T + R)^(-1)`
+6. Updates state: `x = x + K·(z - h(x))`
+7. Updates covariance using Joseph form
+
+#### `initialize_from_imu(self)`
+Computes initial state from stationary IMU readings:
+- Gyro mean → gyroscope bias
+- Accel direction → initial orientation (gravity alignment)
+- Accel magnitude → gravity model calibration
+
+#### `_zupt_velocity_update(self)`
+Formal EKF update when stationary:
+- Measurement: body velocity = 0
+- Updates both state and covariance consistently
+
+#### `_zupt_gravity_update(self, a_corrected)`
+Tilt correction from accelerometer during stationary:
+- Uses accelerometer as tilt sensor
+- Corrects roll/pitch drift
+
+#### `_reinitialize_orientation(self, a_m, w_m)`
+Smart recovery when filter diverges:
+- Re-estimates roll/pitch from accelerometer
+- Preserves yaw (gravity doesn't provide yaw)
+- Resets velocity to zero
+- Expands covariance
+
+#### `publish_state(self, stamp)`
+Publishes filter outputs:
+- Odometry message to `/vio/odom`
+- Path for trajectory visualization
+- TF transform `map → base_footprint_vio`
+- Diagnostics (biases, covariances, velocities)
+
+#### `publish_synthetic_cmd_vel(self)`
+Publishes Twist messages to `/cmd_vel` matching synthetic prediction parameters.
+
+---
+
+## Vision Node (vision_node.py)
+
+ArUco marker detection frontend.
+
+### Class: `VisionNode`
+
+#### Purpose
+Detects ArUco markers (DICT_4X4_50) in camera images and publishes their pixel coordinates with unique IDs.
+
+#### Key Features
+- **Subpixel Corner Refinement**: Improves measurement accuracy
+- **Aggressive Detection**: Tuned for varying lighting and distances
+- **CLAHE Enhancement**: Contrast Limited Adaptive Histogram Equalization for poor textures
+
+#### Methods
+
+##### `image_callback(self, msg)`
+Processes each camera frame:
+1. Converts ROS Image to OpenCV format
+2. Applies CLAHE contrast enhancement
+3. Detects ArUco markers
+4. Extracts center pixel coordinates
+5. Publishes PoseArray with (u, v, marker_id)
+
+#### Output Format
+```
+PoseArray:
+  poses[i].position.x = u (pixel)
+  poses[i].position.y = v (pixel)
+  poses[i].position.z = marker_id
 ```
 
 ---
 
-### 3. EvaluationNode (`eval_node.py`)
+## Evaluation Node (eval_node.py)
 
-Real-time evaluation with ground truth comparison and diagnostic plotting.
+Trajectory evaluation and visualization.
 
-#### Class: `EvaluationNode`
+### Class: `EvaluationNode`
 
-| Method | Description |
-|--------|-------------|
-| `__init__()` | Subscribes to `/vio/odom`, `/ground_truth/odom`, `/vio/diagnostics` |
-| `est_callback(msg)` | Computes position/yaw error, logs metrics |
-| `gt_callback(msg)` | Stores latest ground truth |
-| `diag_callback(msg)` | Records bias, covariance, velocity diagnostics |
-| `save_plots()` | Generates 7 evaluation plots on shutdown |
+#### Purpose
+Computes error metrics and generates plots comparing EKF estimate to ground truth.
 
-**Diagnostics Message Format** (`/vio/diagnostics`):
-```
-Float64MultiArray.data[0:6]   = [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
-Float64MultiArray.data[6:21]  = P diagonal (position, velocity, orientation, ba, bg)
-Float64MultiArray.data[21:25] = [vx, vy, vz, speed]
-Float64MultiArray.data[25]    = vision_correction_magnitude
-```
+#### Metrics Computed
+- **RMSE**: Root Mean Square Error
+- **ATE**: Absolute Trajectory Error
+- **Per-axis errors**: X, Y, Z position errors
+- **Yaw error**: Heading error in degrees
 
-**Generated Plots:**
-1. `trajectory_plot.png` - 2D trajectory comparison
-2. `error_plot.png` - Position error over time
-3. `position_comparison.png` - X, Y, Z comparison
-4. `yaw_comparison.png` - Yaw angle comparison
-5. `bias_plot.png` - Accelerometer and gyroscope biases
-6. `covariance_plot.png` - Uncertainty evolution (6 subplots)
-7. `velocity_plot.png` - Body-frame velocity components
+#### Methods
+
+##### `est_callback(self, msg)`
+Processes EKF odometry estimates:
+- Matches with closest ground truth
+- Computes position and yaw errors
+- Logs real-time metrics
+
+##### `diag_callback(self, msg)`
+Processes EKF diagnostics:
+- Stores bias histories
+- Stores covariance histories
+- Stores velocity and speed
+
+##### `save_results(self)`
+Generates comprehensive plots:
+- XY trajectory comparison
+- Error over time (position and yaw)
+- Bias evolution
+- Covariance evolution
+- Velocity profiles
 
 ---
 
-### 4. pose_tf_broadcaster (`pose_tf_broadcaster.cpp`)
+## Ground Truth Broadcaster (pose_tf_broadcaster.cpp)
 
-C++ node for broadcasting TF frames.
+### Class: `PoseTfBroadcaster`
 
-**Published Transforms:**
-- `odom` → `base_link` (from EKF estimate)
+#### Purpose
+Extracts ground truth robot pose from Gazebo world info and publishes to ROS2.
+
+#### Functionality
+- Subscribes to `/world/vio_world/dynamic_pose/info`
+- Extracts pose for "turtlebot3" model
+- Publishes to `/ground_truth/odom`
+- Broadcasts TF: `map → base_footprint_gt`
+
+---
+
+## Configuration Parameters
+
+### File: `config/ekf_params.yaml`
+
+#### Filter Mode Switches
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enable_prediction` | bool | true | Enable IMU-based prediction step |
+| `enable_correction` | bool | true | Enable camera measurement updates |
+| `enable_zupt` | bool | true | Enable Zero-Velocity Update |
+| `enable_imu_lever_arm` | bool | true | Compensate for IMU offset from body origin |
+
+#### Synthetic Prediction Mode
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `synthetic_velocity` | float | 0.0 | Forward velocity when prediction disabled (m/s) |
+| `synthetic_omega` | float | 0.0 | Yaw rate when prediction disabled (rad/s) |
+
+When `enable_prediction=false`:
+- Filter uses synthetic velocity/omega instead of IMU
+- Publishes matching cmd_vel to move robot in simulation
+- Useful for testing vision-only performance
+
+#### Process Noise (Q) - IMU Trust
+
+| Parameter | Type | Default | Effect |
+|-----------|------|---------|--------|
+| `sigma_accel` | float | 1.5 | Accel noise σ (m/s²). Higher = less trust in IMU |
+| `sigma_gyro` | float | 0.5 | Gyro noise σ (rad/s). Higher = less trust in IMU |
+| `sigma_accel_bias` | float | 0.01 | Accel bias random walk. Higher = faster bias adaptation |
+| `sigma_gyro_bias` | float | 0.01 | Gyro bias random walk. Higher = faster bias adaptation |
+
+#### Measurement Noise (R) - Camera Trust
+
+| Parameter | Type | Default | Effect |
+|-----------|------|---------|--------|
+| `R_camera` | float | 35.0 | Pixel noise variance. Lower = more trust in camera |
+
+#### ZUPT Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `zupt_gyro_threshold` | float | 0.02 | Gyro threshold for stationary detection (rad/s) |
+| `R_zupt_velocity` | float | 0.001 | ZUPT velocity measurement noise |
+
+#### Outlier Rejection
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mahalanobis_threshold` | float | 60.0 | Threshold for measurement gating |
+
+#### Timing
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `imu_downsample_factor` | int | 4 | 200Hz / factor = effective IMU rate |
+| `max_time_delay` | float | 0.15 | Max acceptable vision-IMU time mismatch (s) |
+
+---
+
+## Launch System
+
+### File: `launch/vio_ekf.launch.py`
+
+#### Nodes Launched
+
+| Node | Package | Description |
+|------|---------|-------------|
+| `gz_sim` | ExecuteProcess | Gazebo Harmonic simulation |
+| `parameter_bridge` | ros_gz_bridge | ROS2 ↔ Gazebo message bridge |
+| `pose_tf_broadcaster` | vio_ekf | Ground truth extraction |
+| `robot_state_publisher` | robot_state_publisher | Robot URDF publishing |
+| `ekf_node` | vio_ekf | Main EKF filter |
+| `vision_node` | vio_ekf | ArUco detection |
+| `rviz2` | rviz2 | Visualization |
+
+#### TF Frames Published
+- `world → map` (static, identity)
+- `world → odom` (static, identity)
+- `map → base_footprint_vio` (from EKF)
+- `map → base_footprint_gt` (from ground truth)
 
 ---
 
@@ -293,137 +385,144 @@ C++ node for broadcasting TF frames.
 
 ### Subscriptions
 
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/imu` | `sensor_msgs/Imu` | IMU data at 200Hz |
-| `/camera` | `sensor_msgs/Image` | Camera images |
-| `/camera_info` | `sensor_msgs/CameraInfo` | Camera intrinsics |
-| `/vio/landmarks` | `geometry_msgs/PoseArray` | Detected ArUco markers |
-| `/ground_truth/odom` | `nav_msgs/Odometry` | Ground truth pose |
+| Topic | Type | Node | Description |
+|-------|------|------|-------------|
+| `/imu` | sensor_msgs/Imu | ekf_node | IMU measurements at 200Hz |
+| `/camera` | sensor_msgs/Image | vision_node | Camera images |
+| `/camera_info` | sensor_msgs/CameraInfo | ekf_node | Camera intrinsics |
+| `/vio/landmarks` | geometry_msgs/PoseArray | ekf_node | Detected ArUco markers |
+| `/ground_truth/odom` | nav_msgs/Odometry | ekf_node, eval_node | Ground truth pose |
 
 ### Publications
 
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/vio/odom` | `nav_msgs/Odometry` | EKF pose estimate |
-| `/vio/path` | `nav_msgs/Path` | Trajectory visualization |
-| `/vio/diagnostics` | `std_msgs/Float64MultiArray` | Internal filter states |
+| Topic | Type | Node | Description |
+|-------|------|------|-------------|
+| `/vio/odom` | nav_msgs/Odometry | ekf_node | EKF pose estimate |
+| `/vio/path` | nav_msgs/Path | ekf_node | Trajectory history |
+| `/vio/diagnostics` | std_msgs/Float64MultiArray | ekf_node | Filter internals |
+| `/vio/landmarks` | geometry_msgs/PoseArray | vision_node | Detected markers |
+| `/cmd_vel` | geometry_msgs/Twist | ekf_node | Robot velocity commands (synthetic mode) |
 
 ---
 
-## Configuration Parameters
+## Coordinate Frames
 
-### Noise Parameters
+### Frame Definitions
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `sigma_a` | 1.5 m/s² | Accelerometer noise std dev |
-| `sigma_g` | 0.5 rad/s | Gyroscope noise std dev |
-| `Q_ba` | 1e-4 | Accelerometer bias random walk |
-| `Q_bg` | 1e-5 | Gyroscope bias random walk |
-| `R_cam` | 35.0 px² | Pixel measurement noise variance |
+| Frame | Convention | Description |
+|-------|------------|-------------|
+| `world` | ENU | Gazebo world frame (East-North-Up) |
+| `map` | ENU | ROS map frame (= world) |
+| `odom` | ENU | Odometry frame (= world) |
+| `base_footprint` | ROS | Robot body center on ground |
+| `base_link` | ROS | Robot body center |
+| `camera_link` | ROS | Camera optical frame |
+| `imu_link` | ROS | IMU sensor frame |
 
-### ZUPT Parameters
+### Body Frame Convention
+- **X**: Forward
+- **Y**: Left
+- **Z**: Up
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `zupt_gyro_threshold` | 0.02 rad/s | Stationary detection threshold |
-| `zupt_window_size` | 50 | Samples for averaging (~250ms) |
-| `R_zupt_velocity` | 0.001 (m/s)² | Zero-velocity measurement noise |
-| `R_zupt_gravity` | 0.1 | Gravity measurement noise |
+### Camera Optical Frame Convention
+- **X**: Right
+- **Y**: Down
+- **Z**: Forward (depth)
 
-### Vision Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `mahalanobis_threshold` | 60.0 | Outlier rejection threshold |
-| `max_consecutive_outliers` | 5 | Before accepting measurements |
-| Per-observation gate | 100 px | Reject if residual > 100px |
-
----
-
-## Landmark Map
-
-24 ArUco markers arranged in a single ring at 2.5m radius, evenly spaced at 15° intervals:
-
+### Transformation: Body → Camera
 ```python
-self.map = {
-    0.0:  np.array([2.50, 0.00, 0.30]),   # East
-    6.0:  np.array([0.00, 2.50, 0.30]),   # North
-    12.0: np.array([-2.50, 0.00, 0.30]),  # West
-    18.0: np.array([0.00, -2.50, 0.30]),  # South
-    # ... 20 more markers
-}
+R_b_c = [[ 0, -1,  0],   # Camera X = -Body Y
+         [ 0,  0, -1],   # Camera Y = -Body Z
+         [ 1,  0,  0]]   # Camera Z = Body X
 ```
 
-All markers are at z=0.30m (camera height) facing inward toward the origin.
-
 ---
 
-## Key Fixes and Design Decisions
+## Filter Modes
 
-### 1. Gravity Sign Fix
-**Problem:** Accelerometer measures specific force, not acceleration.
-**Fix:** `acc_body = a_corrected - g_body` (subtract gravity, not add)
+### 1. Full VIO (Default)
+```yaml
+enable_prediction: true
+enable_correction: true
+enable_zupt: true
+```
+Full sensor fusion: IMU prediction + Camera correction + ZUPT.
 
-### 2. FEJ Disabled
-**Problem:** First-Estimate Jacobians caused gradient to point wrong direction when yaw deviated from first observation.
-**Fix:** Use current `R_wb` for Jacobian computation instead of stored `R_fej`.
+### 2. IMU Only (Prediction Only)
+```yaml
+enable_prediction: true
+enable_correction: false
+enable_zupt: true
+```
+Tests IMU integration quality. Expect drift over time.
 
-### 3. ba_z Locked to Zero
-**Problem:** Z-accelerometer bias is unobservable for ground robots (coupled with gravity).
-**Fix:** Lock `ba_z = 0`, zero its covariance column/row, zero process noise.
+### 3. Camera Only (Synthetic Prediction)
+```yaml
+enable_prediction: false
+enable_correction: true
+synthetic_velocity: 0.5
+synthetic_omega: 0.2
+```
+Tests camera measurement quality. Robot moves with constant velocity.
+The filter uses synthetic motion model and sends matching cmd_vel commands.
 
-### 4. Full dx Application with Limits
-**Problem:** Zeroing non-position corrections broke covariance cross-correlations.
-**Fix:** Apply full correction with conservative limits (position ±1.5m, velocity ±0.5m/s, etc.).
-
-### 5. Vision-Based ZUPT Gating
-**Problem:** ZUPT fired during straight-line motion (low gyro but moving).
-**Fix:** If vision correction > 2cm, disable ZUPT for 0.5s cooldown.
-
-### 6. IMU Downsampling
-**Problem:** 200Hz IMU spikes (50 m/s²) caused filter divergence.
-**Fix:** Average every 4 samples → 50Hz (spikes become 12.5 m/s² max).
-
-### 7. Yaw Preservation on Re-init
-**Problem:** IMU re-initialization destroyed yaw (only roll/pitch recoverable from gravity).
-**Fix:** Preserve current yaw, only reset roll/pitch during re-initialization.
+### 4. Stationary Test
+```yaml
+enable_prediction: false
+enable_correction: true
+synthetic_velocity: 0.0
+synthetic_omega: 0.0
+```
+Robot stays still. Tests vision correction on stationary target.
 
 ---
 
 ## Usage
 
-### Build
+### Running the System
 ```bash
+# Build
 cd /workspaces/vio_ws
 colcon build --packages-select vio_ekf
+
+# Source
 source install/setup.bash
+
+# Launch
+ros2 launch vio_ekf vio_ekf.launch.py
 ```
 
-### Run
+### Running Evaluation
 ```bash
-# Terminal 1: Launch simulation
-ros2 launch vio_ekf simulation.launch.py
-
-# Terminal 2: Run EKF
-ros2 run vio_ekf ekf_node.py
-
-# Terminal 3: Run vision
-ros2 run vio_ekf vision_node.py
-
-# Terminal 4: Run evaluation
+# In a new terminal after the system is running
+source install/setup.bash
 ros2 run vio_ekf eval_node.py
+# Drive robot around, then Ctrl+C to save plots
 ```
 
-### View Results
-Press `Ctrl+C` in eval_node terminal to generate plots in `/workspaces/vio_ws/`.
+### Modifying Parameters
+Edit `src/vio_ekf/config/ekf_params.yaml` and re-launch.
 
 ---
 
-## References
+## Troubleshooting
 
-1. Huang, Mourikis, Roumeliotis - "Observability-based Rules for Designing Consistent EKF SLAM Estimators" (IJRR 2010)
-2. Solà, J. - "Quaternion kinematics for the error-state Kalman filter"
-3. Forster et al. - "On-Manifold Preintegration for Real-Time Visual-Inertial Odometry"
-4. Bloesch et al. - "Iterated Extended Kalman Filter Based Visual-Inertial Odometry"
+### Filter Divergence
+- Check for large acceleration spikes in logs
+- Reduce `sigma_accel` to trust IMU more
+- Check camera is detecting markers (`/vio/landmarks` topic)
+
+### Robot Not Moving (Synthetic Mode)
+- Verify `enable_prediction: false` in config
+- Check `synthetic_velocity` and `synthetic_omega` are non-zero
+- Verify `/cmd_vel` topic is being published
+
+### High Position Error
+- Increase `R_camera` if camera is noisy
+- Decrease `R_camera` if filter isn't correcting
+- Check marker positions in `self.map` match world file
+
+### No Markers Detected
+- Check camera topic is publishing (`ros2 topic hz /camera`)
+- Check debug images in `/tmp/aruco_debug_*.png`
+- Verify marker size and dictionary match (DICT_4X4_50)
