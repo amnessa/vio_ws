@@ -25,10 +25,14 @@ ekf_node:
     enable_prediction: true
 
     # Enable/disable correction step (camera measurement updates)
-    enable_correction: true
+    enable_correction: false
 
     # Enable/disable ZUPT (Zero-Velocity Update when stationary)
-    enable_zupt: true
+    enable_zupt: false
+
+    # Enable/disable IMU lever-arm compensation
+    # Compensates for centripetal acceleration when IMU is offset from body origin
+    enable_imu_lever_arm: true
 
     # ==========================================================================
     # PROCESS NOISE (Q) - IMU Model Trust

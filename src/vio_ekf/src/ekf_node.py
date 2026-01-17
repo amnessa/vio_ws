@@ -220,7 +220,32 @@ class EKFNode(Node):
         # Consistent EKF SLAM Estimators" (IJRR 2010)
         self.landmark_first_estimates = {}  # lm_id -> {'p': position, 'R': rotation_matrix}
 
-        # Calibration (Extrinsics: Base -> Camera Optical Frame)
+        # =====================================================================
+        # IMU Extrinsics: IMU frame -> Body frame
+        # =====================================================================
+        # IMU position relative to body frame origin (center of rotation)
+        # The IMU is mounted at [0, 0, 0.068] in body frame
+        # This offset causes lever-arm effects during rotation
+        self.t_b_imu = np.array([0.0, 0.0, 0.068])  # [x, y, z] in body frame
+
+        # IMU orientation relative to body frame (identity = aligned)
+        # If IMU axes are aligned with body axes, this is identity
+        self.R_b_imu = np.eye(3)  # IMU frame aligned with body frame
+
+        # Enable/disable lever-arm compensation
+        self.declare_parameter('enable_imu_lever_arm', True)
+        self.enable_imu_lever_arm = self.get_parameter('enable_imu_lever_arm').value
+
+        if np.linalg.norm(self.t_b_imu) > 0.001:
+            self.get_logger().info(f"IMU lever-arm: [{self.t_b_imu[0]:.3f}, {self.t_b_imu[1]:.3f}, {self.t_b_imu[2]:.3f}] m")
+            if self.enable_imu_lever_arm:
+                self.get_logger().info("IMU lever-arm compensation: ENABLED")
+            else:
+                self.get_logger().info("IMU lever-arm compensation: DISABLED")
+
+        # =====================================================================
+        # Camera Extrinsics: Body frame -> Camera Optical Frame
+        # =====================================================================
         # Camera moved forward to 0.10m to avoid robot body blocking view
         # Total translation: [0.10, 0.0, 0.093]
         self.t_b_c = np.array([0.10, 0.0, 0.093])
@@ -270,9 +295,34 @@ class EKFNode(Node):
         self.K = np.array(msg.k).reshape(3,3)
 
     def imu_callback(self, msg):
-        # Extract measurements
-        a_m = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
-        w_m = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
+        # Extract measurements (in IMU frame)
+        a_imu = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
+        w_imu = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
+
+        # =====================================================================
+        # IMU to Body Frame Transformation
+        # =====================================================================
+        # Transform gyro from IMU frame to body frame
+        # w_body = R_b_imu @ w_imu
+        w_m = self.R_b_imu @ w_imu
+
+        # Transform accel from IMU frame to body frame with lever-arm compensation
+        # The IMU measures: a_imu = a_body + ω × (ω × r) + α × r
+        # Where:
+        #   - ω × (ω × r): centripetal acceleration (points toward rotation axis)
+        #   - α × r: tangential acceleration (from angular acceleration)
+        #   - r = t_b_imu: lever arm from body origin to IMU
+        #
+        # To get body-frame acceleration: a_body = R_b_imu @ a_imu - ω × (ω × r) - α × r
+        # For simplicity, we ignore α × r (requires gyro derivative, typically small)
+
+        a_m = self.R_b_imu @ a_imu
+
+        if self.enable_imu_lever_arm and np.linalg.norm(self.t_b_imu) > 0.001:
+            # Centripetal acceleration compensation: a_cent = ω × (ω × r)
+            # This is the acceleration the IMU feels due to rotating around body origin
+            centripetal = np.cross(w_m, np.cross(w_m, self.t_b_imu))
+            a_m = a_m - centripetal
 
         # --- INITIALIZATION PHASE ---
         # Collect samples while robot is stationary to estimate biases and initial orientation
