@@ -1258,7 +1258,7 @@ class EKFNode(Node):
             P_prior = self.P.copy()
 
         # IEKF iteration parameters
-        MAX_ITERATIONS = 4
+        MAX_ITERATIONS = 1
         CONVERGENCE_THRESHOLD = 0.01  # meters for position, radians for orientation
 
         # Working state for iterations (start from current estimate)

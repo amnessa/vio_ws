@@ -63,19 +63,19 @@
             <x>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>0.0</stddev> <!--close noise vals from these tags -->
+                <stddev>2e-4</stddev> <!--close noise vals from these tags -->
               </noise>
             </x>
             <y>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>0.0</stddev> <!--close noise vals from these tags -->
+                <stddev>2e-4</stddev> <!--close noise vals from these tags -->
               </noise>
             </y>
             <z>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>0.0</stddev> <!--close noise vals from these tags -->
+                <stddev>1e-3</stddev> <!--close noise vals from these tags -->
               </noise>
             </z>
           </angular_velocity>
@@ -83,19 +83,19 @@
             <x>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>0.0</stddev> <!--close noise vals from these tags -->
+                <stddev>1.7e-2</stddev> <!--close noise vals from these tags -->
               </noise>
             </x>
             <y>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>0.0</stddev> <!--close noise vals from these tags -->
+                <stddev>1.7e-2</stddev> <!--close noise vals from these tags -->
               </noise>
             </y>
             <z>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>0.0</stddev> <!--close noise vals from these tags -->
+                <stddev>1.7e-2</stddev> <!--close noise vals from these tags -->
               </noise>
             </z>
           </linear_acceleration>
@@ -431,7 +431,7 @@
           <noise>
             <type>gaussian</type>
             <mean>0.0</mean>
-            <stddev>0.0</stddev> <!--close noise vals from these tags -->
+            <stddev>0.007</stddev> <!--close noise vals from these tags -->
           </noise>
         </camera>
       </sensor>
