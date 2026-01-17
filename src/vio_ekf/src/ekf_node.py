@@ -43,11 +43,56 @@ class EKFNode(Node):
     def __init__(self):
         super().__init__('ekf_node')
 
+        # =======================================================================
+        # DECLARE PARAMETERS (can be set via YAML config or command line)
+        # =======================================================================
+        # Filter mode switches
+        self.declare_parameter('enable_prediction', True)
+        self.declare_parameter('enable_correction', True)
+        self.declare_parameter('enable_zupt', True)
+
+        # Process noise parameters (Q)
+        self.declare_parameter('sigma_accel', 1.5)
+        self.declare_parameter('sigma_gyro', 0.5)
+        self.declare_parameter('sigma_accel_bias', 0.01)  # sqrt(Q_ba)
+        self.declare_parameter('sigma_gyro_bias', 0.00316)  # sqrt(Q_bg)
+
+        # Measurement noise parameters (R)
+        self.declare_parameter('R_camera', 35.0)
+        self.declare_parameter('R_zupt_velocity', 0.001)
+
+        # ZUPT parameters
+        self.declare_parameter('zupt_gyro_threshold', 0.02)
+
+        # Outlier rejection
+        self.declare_parameter('mahalanobis_threshold', 60.0)
+
+        # Timing parameters
+        self.declare_parameter('imu_downsample_factor', 4)
+        self.declare_parameter('max_time_delay', 0.15)
+
+        # =======================================================================
+        # READ PARAMETERS
+        # =======================================================================
+        self.enable_prediction = self.get_parameter('enable_prediction').value
+        self.enable_correction = self.get_parameter('enable_correction').value
+        self.enable_zupt = self.get_parameter('enable_zupt').value
+
+        # Log filter mode
+        mode_str = []
+        if self.enable_prediction:
+            mode_str.append("PREDICTION")
+        if self.enable_correction:
+            mode_str.append("CORRECTION")
+        if self.enable_zupt:
+            mode_str.append("ZUPT")
+        self.get_logger().info(f"=== FILTER MODE: {' + '.join(mode_str) if mode_str else 'DISABLED'} ===")
+
         # --- Initialization Phase ---
         # Collect IMU samples while stationary to estimate biases and initial orientation
         self.initialized = False
         self.init_samples = []
-        self.init_sample_count = 2400  # Reduced from 2400 (1 second at 200Hz)
+        self.init_sample_count = 1200  # Reduced from 2400 (1 second at 200Hz)
         self.gravity_magnitude = 9.81  # Expected gravity magnitude (will be updated from IMU)
         self.g = np.array([0.0, 0.0, 9.81])  # Gravity vector in world frame (will be updated)
 
@@ -75,30 +120,32 @@ class EKFNode(Node):
         self.P[9:12, 9:12] = np.eye(3) * 0.1  # Accel bias uncertainty - higher to allow estimation
         self.P[12:15, 12:15] = np.eye(3) * 0.01  # Gyro bias uncertainty
 
-        # Noise Parameters - Tuned for Gazebo simulation
-        # Higher values = trust IMU less, allow more vision correction
-        self.sigma_a = 1.5      # Accel noise stddev (m/s^2) - higher for Gazebo
-        self.sigma_g = 0.5     # Gyro noise stddev (rad/s) - accounts for simulation noise
+        # Noise Parameters - Read from parameters
+        self.sigma_a = self.get_parameter('sigma_accel').value
+        self.sigma_g = self.get_parameter('sigma_gyro').value
         self.Q_a = self.sigma_a ** 2  # Accel noise variance
         self.Q_g = self.sigma_g ** 2  # Gyro noise variance
-        # Per recommendation2.md: Tune bias random walk carefully.
-        # Too high Q_ba causes filter to use bias to compensate for orientation errors.
-        # Reduced from 5e-4 to allow slower, more stable bias estimation.
-        self.Q_ba = 1e-4  # Accel bias random walk - slower adaptation
-        self.Q_bg = 1e-5  # Gyro bias random walk - slower adaptation
-        self.R_cam = 35.0   # Pixel measurement noise - INCREASED to trust vision less (prevents velocity explosion)
+        sigma_ba = self.get_parameter('sigma_accel_bias').value
+        sigma_bg = self.get_parameter('sigma_gyro_bias').value
+        self.Q_ba = sigma_ba ** 2  # Accel bias random walk
+        self.Q_bg = sigma_bg ** 2  # Gyro bias random walk
+        self.R_cam = self.get_parameter('R_camera').value
+
+        self.get_logger().info(f"Process Noise: sigma_a={self.sigma_a}, sigma_g={self.sigma_g}")
+        self.get_logger().info(f"Bias Walk: Q_ba={self.Q_ba:.2e}, Q_bg={self.Q_bg:.2e}")
+        self.get_logger().info(f"Measurement Noise: R_camera={self.R_cam}")
 
         # ZUPT (Zero-Velocity Update) parameters
         # Per recommend.md Section 5: Trigger ZUPT based solely on gyro activity
         # Ignore accelerometer deviation as it may be caused by orientation error
-        self.zupt_gyro_threshold = 0.02  # rad/s - per recommend.md (<0.02 rad/s)
+        self.zupt_gyro_threshold = self.get_parameter('zupt_gyro_threshold').value
         self.zupt_window = []  # Rolling window of IMU samples
         self.zupt_window_size = 50  # ~250ms at 200Hz
         self.zupt_gyro_only_counter = 0  # Counter for gyro-only stationary detection
         self.zupt_gyro_only_threshold = 100  # 0.5 second at 200Hz - if gyro stable this long, definitely stationary
 
         # Formal ZUPT measurement noise (small = high confidence velocity is zero)
-        self.R_zupt_velocity = 0.001  # (m/s)^2 - very confident velocity is zero when stationary
+        self.R_zupt_velocity = self.get_parameter('R_zupt_velocity').value
         self.R_zupt_gravity = 0.1  # Gravity direction measurement noise for tilt correction
 
         # Vision-based motion detection to prevent false ZUPT
@@ -111,11 +158,11 @@ class EKFNode(Node):
         # This smooths out spikes and noise before EKF sees them
         # A single 50 m/s² spike becomes 12.5 m/s² after averaging with 3 normal samples
         self.imu_buffer = []  # Buffer to collect 4 samples
-        self.imu_downsample_factor = 4  # Average every 4 samples (200Hz → 50Hz)
+        self.imu_downsample_factor = self.get_parameter('imu_downsample_factor').value
         self.imu_accumulated_dt = 0.0  # Accumulated time for the batch
 
         # Outlier rejection settings
-        self.mahalanobis_threshold = 60.0  # Very relaxed - accept most measurements
+        self.mahalanobis_threshold = self.get_parameter('mahalanobis_threshold').value
         self.consecutive_outliers = 0
         self.max_consecutive_outliers = 5  # Quick recovery after just 3 rejections
 
@@ -127,7 +174,7 @@ class EKFNode(Node):
         self.gravity_correction_gain = 0.005  # Very conservative - minimal jitter
 
         # Time sync tolerance (max acceptable delay between IMU and vision)
-        self.max_time_delay = 0.15  # 150ms tolerance (relaxed for Gazebo)
+        self.max_time_delay = self.get_parameter('max_time_delay').value
 
         # State buffer for time delay compensation (per recommend.md)
         # Store recent states to match vision measurements with correct pose
@@ -279,7 +326,8 @@ class EKFNode(Node):
         self.imu_accumulated_dt = 0.0
 
         # --- PREDICTION STEP with averaged IMU data ---
-        self.predict(batch_dt, avg_accel, avg_gyro)
+        if self.enable_prediction:
+            self.predict(batch_dt, avg_accel, avg_gyro)
         self.publish_state(msg.header.stamp)
 
     def initialize_from_imu(self):
@@ -769,12 +817,13 @@ class EKFNode(Node):
                 # --- ZUPT Part 1: Formal Velocity Update (per recommend.md Section 5) ---
                 # Perform a FORMAL EKF update with z=0, v=0 instead of direct state override.
                 # This updates both state AND covariance consistently.
-                self._zupt_velocity_update()
+                if self.enable_zupt:
+                    self._zupt_velocity_update()
 
-                # --- ZUPT Part 2: Formal Gravity Measurement Update (per recommend.md Section 1) ---
-                # Treat accelerometer as a TILT SENSOR during stationary periods.
-                # This corrects orientation drift with proper covariance update.
-                self._zupt_gravity_update(a_corrected)
+                    # --- ZUPT Part 2: Formal Gravity Measurement Update (per recommend.md Section 1) ---
+                    # Treat accelerometer as a TILT SENSOR during stationary periods.
+                    # This corrects orientation drift with proper covariance update.
+                    self._zupt_gravity_update(a_corrected)
 
         # ===================================================================
         # STEP 1: Nominal State Propagation (Non-linear Kinematics)
@@ -1120,6 +1169,10 @@ class EKFNode(Node):
         Per recommend.md: Use state buffer to find pose at image capture time,
         not current time, to avoid linearization errors from motion during delay.
         """
+        # Skip if correction is disabled
+        if not self.enable_correction:
+            return
+
         # Skip if not initialized
         if not self.initialized:
             return

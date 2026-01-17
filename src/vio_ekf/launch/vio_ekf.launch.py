@@ -142,12 +142,14 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}],
     )
 
+    # EKF Node with config file
+    ekf_config = os.path.join(pkg_vio, 'config', 'ekf_params.yaml')
     ekf_node = Node(
         package='vio_ekf',
         executable='ekf_node.py',
         name='ekf_node',
         output='screen',
-        parameters=[{'use_sim_time': True}],
+        parameters=[ekf_config],
     )
 
     return LaunchDescription([

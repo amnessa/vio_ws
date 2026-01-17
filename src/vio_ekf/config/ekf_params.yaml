@@ -1,0 +1,146 @@
+# EKF Configuration Parameters
+# ============================================================================
+# Use this file to test different filter modes and tune aggressiveness.
+#
+# QUICK TEST MODES:
+#   1. PREDICTION ONLY (IMU only):     enable_prediction: true,  enable_correction: false
+#   2. CAMERA ONLY (no IMU prop):      enable_prediction: false, enable_correction: true
+#   3. FULL FILTER:                    enable_prediction: true,  enable_correction: true
+#
+# AGGRESSIVENESS TUNING:
+#   - Higher Q values = less trust in IMU (more aggressive correction)
+#   - Lower R values = more trust in camera (more aggressive correction)
+#   - Lower Q values = more trust in IMU (smoother, but may drift)
+#   - Higher R values = less trust in camera (smoother, but may not correct)
+# ============================================================================
+
+ekf_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # ==========================================================================
+    # FILTER MODE SWITCHES
+    # ==========================================================================
+    # Enable/disable prediction step (IMU propagation)
+    enable_prediction: true
+
+    # Enable/disable correction step (camera measurement updates)
+    enable_correction: false
+
+    # Enable/disable ZUPT (Zero-Velocity Update when stationary)
+    enable_zupt: true
+
+    # ==========================================================================
+    # PROCESS NOISE (Q) - IMU Model Trust
+    # ==========================================================================
+    # Higher values = less trust in IMU = filter relies more on measurements
+    # Lower values = more trust in IMU = smoother but may drift
+
+    # Accelerometer noise standard deviation (m/s^2)
+    # Typical MEMS: 0.01-0.1, Gazebo simulation: 0.5-2.0
+    sigma_accel: 1.5
+
+    # Gyroscope noise standard deviation (rad/s)
+    # Typical MEMS: 0.001-0.01, Gazebo simulation: 0.1-1.0
+    sigma_gyro: 0.5
+
+    # Accelerometer bias random walk (m/s^2/sqrt(s))
+    # Lower = more stable bias estimate, Higher = faster adaptation
+    sigma_accel_bias: 0.01  # sqrt(1e-4)
+
+    # Gyroscope bias random walk (rad/s/sqrt(s))
+    sigma_gyro_bias: 0.00316  # sqrt(1e-5)
+
+    # ==========================================================================
+    # MEASUREMENT NOISE (R) - Camera Trust
+    # ==========================================================================
+    # Lower values = more trust in camera = faster correction
+    # Higher values = less trust in camera = smoother but may not correct drift
+
+    # Pixel measurement noise standard deviation (pixels)
+    # Low (5-15): Very aggressive correction, may cause jitter
+    # Medium (20-40): Balanced
+    # High (50-100): Conservative, smooth but slow correction
+    R_camera: 35.0
+
+    # ==========================================================================
+    # ZUPT PARAMETERS
+    # ==========================================================================
+    # Gyro threshold for stationary detection (rad/s)
+    zupt_gyro_threshold: 0.02
+
+    # ZUPT measurement noise for velocity (m/s)^2
+    R_zupt_velocity: 0.001
+
+    # ==========================================================================
+    # OUTLIER REJECTION
+    # ==========================================================================
+    # Mahalanobis distance threshold for measurement gating
+    # Lower = stricter rejection, Higher = accept more measurements
+    mahalanobis_threshold: 60.0
+
+    # ==========================================================================
+    # TIMING PARAMETERS
+    # ==========================================================================
+    # IMU downsample factor (200Hz / factor = effective rate)
+    imu_downsample_factor: 4
+
+    # Max time delay tolerance between IMU and vision (seconds)
+    max_time_delay: 0.15
+
+# =============================================================================
+# PRESET CONFIGURATIONS (copy/paste to test)
+# =============================================================================
+
+# --- PREDICTION ONLY (IMU Odometry Test) ---
+# Tests how well IMU integration works without any correction.
+# Expect drift over time - this is normal!
+#
+# ekf_node:
+#   ros__parameters:
+#     enable_prediction: true
+#     enable_correction: false
+#     enable_zupt: true  # Can keep ZUPT for stationary periods
+
+# --- CAMERA ONLY (Pure Vision) ---
+# Tests camera measurement quality. Robot "teleports" between measurements.
+# No smooth motion - each camera update sets position directly.
+#
+# ekf_node:
+#   ros__parameters:
+#     enable_prediction: false
+#     enable_correction: true
+
+# --- AGGRESSIVE CORRECTION ---
+# Low R = trust camera more, faster drift correction.
+# May cause jitter/jumps if camera is noisy.
+#
+# ekf_node:
+#   ros__parameters:
+#     enable_prediction: true
+#     enable_correction: true
+#     R_camera: 10.0
+#     sigma_accel: 2.0
+#     sigma_gyro: 1.0
+
+# --- SMOOTH/CONSERVATIVE ---
+# High R, Low Q = trust IMU more, slower correction.
+# Smoother trajectory but may not correct large drifts quickly.
+#
+# ekf_node:
+#   ros__parameters:
+#     enable_prediction: true
+#     enable_correction: true
+#     R_camera: 100.0
+#     sigma_accel: 0.5
+#     sigma_gyro: 0.1
+
+# --- BALANCED (Default) ---
+# ekf_node:
+#   ros__parameters:
+#     enable_prediction: true
+#     enable_correction: true
+#     enable_zupt: true
+#     sigma_accel: 1.5
+#     sigma_gyro: 0.5
+#     R_camera: 35.0
