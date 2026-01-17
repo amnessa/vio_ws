@@ -28,7 +28,7 @@ ekf_node:
     enable_correction: false
 
     # Enable/disable ZUPT (Zero-Velocity Update when stationary)
-    enable_zupt: true
+    enable_zupt: false
 
     # ==========================================================================
     # PROCESS NOISE (Q) - IMU Model Trust
@@ -38,18 +38,18 @@ ekf_node:
 
     # Accelerometer noise standard deviation (m/s^2)
     # Typical MEMS: 0.01-0.1, Gazebo simulation: 0.5-2.0
-    sigma_accel: 1.5
+    sigma_accel: 0.0
 
     # Gyroscope noise standard deviation (rad/s)
     # Typical MEMS: 0.001-0.01, Gazebo simulation: 0.1-1.0
-    sigma_gyro: 0.5
+    sigma_gyro: 0.0
 
     # Accelerometer bias random walk (m/s^2/sqrt(s))
     # Lower = more stable bias estimate, Higher = faster adaptation
-    sigma_accel_bias: 0.01  # sqrt(1e-4)
+    sigma_accel_bias: 0.0  # sqrt(1e-4)
 
     # Gyroscope bias random walk (rad/s/sqrt(s))
-    sigma_gyro_bias: 0.00316  # sqrt(1e-5)
+    sigma_gyro_bias: 0.0  # sqrt(1e-5)
 
     # ==========================================================================
     # MEASUREMENT NOISE (R) - Camera Trust

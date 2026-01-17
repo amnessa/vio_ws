@@ -61,19 +61,19 @@
             <x>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>2e-4</stddev>
+                <stddev>0.0</stddev> <!--close noise vals from these tags -->
               </noise>
             </x>
             <y>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>2e-4</stddev>
+                <stddev>0.0</stddev> <!--close noise vals from these tags -->
               </noise>
             </y>
             <z>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>2e-4</stddev>
+                <stddev>0.0</stddev> <!--close noise vals from these tags -->
               </noise>
             </z>
           </angular_velocity>
@@ -81,19 +81,19 @@
             <x>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>1.7e-2</stddev>
+                <stddev>0.0</stddev> <!--close noise vals from these tags -->
               </noise>
             </x>
             <y>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>1.7e-2</stddev>
+                <stddev>0.0</stddev> <!--close noise vals from these tags -->
               </noise>
             </y>
             <z>
               <noise type="gaussian">
                 <mean>0.0</mean>
-                <stddev>1.7e-2</stddev>
+                <stddev>0.0</stddev> <!--close noise vals from these tags -->
               </noise>
             </z>
           </linear_acceleration>
@@ -296,7 +296,11 @@
     </link>
 
     <link name='caster_back_right_link'>
-      <pose>-0.177 -0.064 -0.004 -1.57 0 0</pose>
+      <!-- Z position adjusted: drive wheel bottom at z=0.023-0.033=-0.010 relative to base_link -->
+      <!-- Caster radius=0.010, so caster center should be at z=-0.010+0.010=0.0 for level robot -->
+      <!-- But base_link is 0.010 above base_footprint, so relative to base_link: z=0.0-0.010=-0.010? -->
+      <!-- Let's try z=0.000 to raise the casters and level the robot -->
+      <pose>-0.177 -0.064 0.000 -1.57 0 0</pose>
       <inertial>
         <!-- Increased mass for stability (was 0.001) -->
         <mass>1.0</mass>
@@ -344,7 +348,8 @@
     </link>
 
     <link name='caster_back_left_link'>
-      <pose>-0.177 0.064 -0.004 -1.57 0 0</pose>
+      <!-- Z position adjusted to match right caster for level robot -->
+      <pose>-0.177 0.064 0.000 -1.57 0 0</pose>
       <inertial>
         <!-- Increased mass for stability (was 0.001) -->
         <mass>1.0</mass>
@@ -424,7 +429,7 @@
           <noise>
             <type>gaussian</type>
             <mean>0.0</mean>
-            <stddev>0.007</stddev>
+            <stddev>0.0</stddev> <!--close noise vals from these tags -->
           </noise>
         </camera>
       </sensor>
