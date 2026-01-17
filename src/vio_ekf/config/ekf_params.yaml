@@ -53,7 +53,7 @@ ekf_node:
     sigma_accel_bias: 1e-4  # sqrt(1e-4)
 
     # Gyroscope bias random walk (rad/s/sqrt(s))
-    sigma_gyro_bias: 1e-5  # sqrt(1e-5)
+    sigma_gyro_bias: 1e-4  # sqrt(1e-4)
 
     # ==========================================================================
     # MEASUREMENT NOISE (R) - Camera Trust

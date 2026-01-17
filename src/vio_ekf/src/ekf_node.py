@@ -55,7 +55,7 @@ class EKFNode(Node):
         self.declare_parameter('sigma_accel', 1.5)
         self.declare_parameter('sigma_gyro', 0.5)
         self.declare_parameter('sigma_accel_bias', 0.01)  # sqrt(Q_ba)
-        self.declare_parameter('sigma_gyro_bias', 0.00316)  # sqrt(Q_bg)
+        self.declare_parameter('sigma_gyro_bias', 0.01)  # sqrt(Q_bg)
 
         # Measurement noise parameters (R)
         self.declare_parameter('R_camera', 35.0)
