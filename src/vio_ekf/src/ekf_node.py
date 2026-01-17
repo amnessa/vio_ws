@@ -2,7 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, CameraInfo
-from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import Float64MultiArray
 from tf2_ros import TransformBroadcaster
@@ -298,11 +298,38 @@ class EKFNode(Node):
         self.pub_diag = self.create_publisher(Float64MultiArray, '/vio/diagnostics', 10)
         self.tf_br = TransformBroadcaster(self)
 
+        # cmd_vel publisher for synthetic prediction mode
+        # When enable_prediction=False, we send cmd_vel commands matching synthetic velocity/omega
+        self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # Log synthetic mode info
+        if not self.enable_prediction:
+            self.get_logger().info(f"Synthetic mode: cmd_vel will be published after initialization")
+            self.get_logger().info(f"  linear.x = {self.synthetic_velocity} m/s, angular.z = {self.synthetic_omega} rad/s")
+
         self.get_logger().info("EKF Node Initialized")
 
     def info_callback(self, msg):
         # Update intrinsics matrix K
         self.K = np.array(msg.k).reshape(3,3)
+
+    def publish_synthetic_cmd_vel(self):
+        """
+        Publish cmd_vel commands for synthetic prediction mode.
+
+        When enable_prediction=False, we use synthetic velocity/omega for EKF prediction.
+        This function sends matching cmd_vel commands to actually move the robot,
+        so the simulated motion matches our synthetic prediction model.
+        """
+        cmd = Twist()
+        cmd.linear.x = float(self.synthetic_velocity)
+        cmd.linear.y = 0.0
+        cmd.linear.z = 0.0
+        cmd.angular.x = 0.0
+        cmd.angular.y = 0.0
+        cmd.angular.z = float(self.synthetic_omega)
+
+        self.pub_cmd_vel.publish(cmd)
 
     def imu_callback(self, msg):
         # Extract measurements (in IMU frame)
@@ -393,6 +420,8 @@ class EKFNode(Node):
             # Synthetic "frozen" prediction for measurement-only testing
             # This keeps the filter alive (P stays healthy) while ignoring IMU noise
             self.predict_synthetic(batch_dt, self.synthetic_velocity, self.synthetic_omega)
+            # Also send cmd_vel to actually move the robot in simulation
+            self.publish_synthetic_cmd_vel()
 
         self.publish_state(msg.header.stamp)
 
@@ -511,6 +540,9 @@ class EKFNode(Node):
         self.init_samples = []
         self.initialized = True
         self.get_logger().info("=== EKF INITIALIZED - Starting state estimation ===")
+
+        if not self.enable_prediction:
+            self.get_logger().info("=== SYNTHETIC MODE: cmd_vel commands will now be published ===")
 
     def _reinitialize_orientation(self, a_m, w_m):
         """
