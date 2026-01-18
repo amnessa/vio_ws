@@ -10,6 +10,8 @@
 
 This report documents the implementation journey of an Error-State Extended Kalman Filter (ES-EKF) for Visual-Inertial Odometry. The project evolved through multiple debugging iterations, with the filter initially diverging within 20-30 seconds to eventually achieving stable, accurate pose estimation. The breakthrough came from implementing comprehensive diagnostic plotting, which revealed previously hidden internal filter dynamics and led to three critical fixes.
 
+The final implementation uses a **range-bearing measurement model** for ArUco landmark observations, providing intuitive planar-only updates that naturally decouple from unobservable Z states.
+
 **Final Performance:** Stable operation with sub-meter accuracy over extended runs.
 
 ---
@@ -22,7 +24,7 @@ The project began with a standard ES-EKF implementation:
 - **State:** 16D nominal state [position, velocity, quaternion, accel_bias, gyro_bias]
 - **Error State:** 15D using rotation vector for orientation
 - **Sensors:** 200Hz IMU, camera with 24 ArUco markers
-- **Vision:** Pinhole projection model with known landmark map
+- **Vision:** Initially pinhole projection (pixel-based), later changed to **range-bearing model**
 
 ### 1.2 Initial Problems
 
@@ -324,7 +326,76 @@ self.x += dx  # Apply full (limited) correction
 
 ---
 
-## 7. Evolution of Diagnostic Capability
+## 7. Evolution to Range-Bearing Model
+
+### 7.1 Problems with Pixel-Based Measurements
+
+The original implementation used pixel coordinates (u, v) as measurements:
+```python
+z = [u, v]  # Pixel projection
+H = J_proj @ J_transform  # Complex 3D projection Jacobian
+```
+
+**Issues identified:**
+1. **3D coupling:** Pixel Jacobian coupled X, Y, and Z position states
+2. **Complex projection:** Required camera intrinsics in measurement model
+3. **Batch processing:** Needed IEKF iterations for multiple landmarks
+4. **Z contamination:** Even with planar constraints, Z-related gradients leaked through
+
+### 7.2 Range-Bearing Model
+
+Replaced pixels with intuitive range-bearing measurements:
+```python
+z = [range, bearing]
+range = ||lm_body[0:2]||      # Planar XY distance
+bearing = atan2(lm_body[1], lm_body[0])  # Angle in body XY plane
+```
+
+**Advantages:**
+1. **Naturally planar:** Uses only XY components, Z is decoupled
+2. **Intuitive:** Range tells "how far", bearing tells "which direction"
+3. **Sequential updates:** Each landmark processed independently
+4. **Simpler Jacobians:** 2D gradients, no camera projection
+
+### 7.3 Jacobian Structure
+
+```python
+# Measurement gradients (2D, planar only)
+dr_dlm = [lx/r, ly/r]           # Range gradient
+db_dlm = [-ly/r², lx/r²]        # Bearing gradient
+
+# Use only XY rows of transformation Jacobians
+R_wb_T_xy = R_wb.T[0:2, :]      # 2x3 submatrix
+
+# Assemble H (2x15) with explicit Z zeroing
+H[:, 2] = 0.0  # No p_z dependence
+H[:, 5] = 0.0  # No v_z dependence
+```
+
+### 7.4 Bearing from Pixels
+
+The measured bearing is extracted from pixel coordinates:
+```python
+# Normalized image coordinates
+x_norm = (u - cx) / fx
+
+# Bearing in body frame (camera Z ≈ body X)
+meas_bearing = atan2(-x_norm, 1.0)
+```
+
+### 7.5 Range Measurement
+
+Range is computed from the known landmark position transformed to camera frame:
+```python
+lm_cam = R_b_c @ (lm_body - t_b_c)
+meas_range = ||lm_cam[0:2]||  # XY distance in camera frame
+```
+
+This uses the map knowledge combined with current state estimate, providing range that updates as the filter converges.
+
+---
+
+## 8. Evolution of Diagnostic Capability
 
 | Stage | Visibility | Debugging Approach |
 |-------|------------|-------------------|
@@ -337,7 +408,7 @@ The diagnostic plots transformed debugging from guesswork to forensic analysis.
 
 ---
 
-## 8. Final System Architecture
+## 9. Final System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -349,12 +420,20 @@ The diagnostic plots transformed debugging from guesswork to forensic analysis.
 │                                        │                        │
 │                                        ▼                        │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐                  │
-│  │  Vision  │───▶│   IEKF   │───▶│  State   │                  │
-│  │ Markers  │    │  Update  │    │ Publish  │                  │
+│  │  Vision  │───▶│  Range-  │───▶│  State   │                  │
+│  │ Markers  │    │ Bearing  │    │ Publish  │                  │
+│  │ (pixels) │    │  Update  │    │          │                  │
 │  └──────────┘    └──────────┘    └──────────┘                  │
-│                                        │                        │
-│                       ┌────────────────┴────────────────┐      │
-│                       ▼                                  ▼      │
+│       │                │                │                       │
+│       │     ┌──────────┴──────────┐     │                       │
+│       │     │ For each landmark:  │     │                       │
+│       │     │ • Compute range (m) │     │                       │
+│       │     │ • Compute bearing   │     │                       │
+│       │     │ • Sequential update │     │                       │
+│       │     └─────────────────────┘     │                       │
+│       │                                 │                       │
+│       └─────────────────┬───────────────┘                      │
+│                         ▼                                       │
 │                 /vio/odom                        /vio/diagnostics│
 └─────────────────────────────────────────────────────────────────┘
                         │                                  │
@@ -369,7 +448,7 @@ The diagnostic plots transformed debugging from guesswork to forensic analysis.
 
 ---
 
-## 9. Lessons Learned
+## 10. Lessons Learned
 
 ### 9.1 Technical Lessons
 
@@ -395,16 +474,16 @@ The diagnostic plots transformed debugging from guesswork to forensic analysis.
 
 ---
 
-## 10. Summary of All Changes
+## 11. Summary of All Changes
 
 | Category | Change | Impact |
 |----------|--------|--------|
 | **Physics** | Gravity sign fix (subtract, not add) | Correct acceleration model |
 | **Formulation** | Robocentric velocity (body frame) | Decouple yaw from velocity |
-| **Vision** | Position-only H matrix | Prevent spurious orientation updates |
-| **Vision** | Per-observation 100px gate | Reject bad measurements |
-| **Vision** | IEKF iterations (up to 4) | Handle large residuals |
-| **Vision** | Require 2+ markers | Observability guarantee |
+| **Vision** | Range-bearing model (replaces pixels) | Naturally planar, intuitive measurements |
+| **Vision** | Sequential updates per landmark | Simpler than batch IEKF |
+| **Vision** | Planar Jacobians (H[:, 2]=0, H[:, 5]=0) | No Z-state contamination |
+| **Vision** | R_range=0.1m, R_bearing=0.05rad noise | Tuned measurement uncertainty |
 | **ZUPT** | Formal velocity update | Proper covariance collapse |
 | **ZUPT** | Gravity tilt correction | Lock roll/pitch when stationary |
 | **ZUPT** | Vision motion detection | Prevent false triggering |
@@ -414,12 +493,12 @@ The diagnostic plots transformed debugging from guesswork to forensic analysis.
 | **Ground** | Roll/pitch clamp ±10° | Physical limit |
 | **FEJ** | Disabled (use current R) | Correct gradient direction |
 | **Bias** | ba_z locked to zero | Remove unobservable state |
-| **Update** | Full dx with limits | Maintain covariance consistency |
+| **Update** | G·P·G^T covariance reset | Proper ESKF error reset |
 | **Diagnostics** | Bias/covariance/velocity plots | Enable forensic debugging |
 
 ---
 
-## 11. Conclusion
+## 12. Conclusion
 
 The VIO ES-EKF project evolved from a diverging prototype to a stable localization system through systematic debugging. The key breakthrough was implementing comprehensive diagnostic plotting, which transformed opaque filter behavior into interpretable time-series data. This visibility enabled identification of three critical issues (FEJ, ba_z, dx zeroing) that would have been nearly impossible to find otherwise.
 

@@ -28,7 +28,7 @@ This project implements a Visual-Inertial Odometry (VIO) system using an Error-S
 ### Purpose
 Estimate 6-DOF robot pose (position and orientation) by fusing:
 - **IMU**: High-rate (200Hz) inertial measurements for motion prediction
-- **Camera**: Lower-rate (~30Hz) ArUco marker observations for drift correction
+- **Camera**: Lower-rate (~30Hz) ArUco marker observations for drift correction using **range-bearing** measurements
 
 ### Key Features
 - **Robocentric Formulation**: Velocity expressed in body frame to decouple observable states from unobservable global yaw
@@ -156,21 +156,22 @@ Synthetic "frozen" prediction for measurement-only testing:
 - Publishes matching cmd_vel to move the robot
 
 #### `vision_callback(self, msg)`
-Handles ArUco marker observations:
-1. Matches vision timestamp to buffered IMU state
-2. Collects valid landmark observations
-3. Requires 2+ markers for observability
-4. Calls `batch_update()` for measurement update
+Handles ArUco marker observations using **range-bearing** model:
+1. Converts pixel coordinates to bearing angle (from camera geometry)
+2. Computes range from known landmark position transformed to camera frame
+3. For each detected landmark, calls `range_bearing_update()` sequentially
+4. Logs number of landmarks updated
 
-#### `batch_update(self, observations, buffered_state)`
-Iterated EKF (IEKF) measurement update:
-1. Projects landmarks from world → body → camera → pixels
-2. Computes residuals (measured - predicted pixels)
-3. Rejects outliers (>100px error)
-4. Builds stacked Jacobian H and measurement matrix
-5. Computes Kalman gain: `K = P·H^T·(H·P·H^T + R)^(-1)`
-6. Updates state: `x = x + K·(z - h(x))`
-7. Updates covariance using Joseph form
+#### `range_bearing_update(self, lm_world, meas_range, meas_bearing, lm_id)`
+Sequential EKF update using range-bearing measurements:
+1. Transforms landmark to body frame: `lm_body = R_wb^T @ (lm_world - p_w)`
+2. Computes predicted range: `r = ||lm_body[0:2]||` (planar XY distance)
+3. Computes predicted bearing: `b = atan2(lm_body[1], lm_body[0])`
+4. Computes residual with bearing wrap: `y = [meas_range - r, wrap(meas_bearing - b)]`
+5. Builds planar Jacobian H (2x15) with Z-columns zeroed
+6. Standard Kalman update with Joseph form covariance
+7. Applies G·P·G^T covariance reset after error injection
+8. Enforces planar constraints (z=0, vz=0, ba_z=0)
 
 #### `initialize_from_imu(self)`
 Computes initial state from stationary IMU readings:
@@ -238,6 +239,10 @@ PoseArray:
   poses[i].position.y = v (pixel)
   poses[i].position.z = marker_id
 ```
+
+The EKF node converts these pixel coordinates to range-bearing measurements:
+- **Range**: Planar (XY) distance from robot to landmark in body frame
+- **Bearing**: Angle from body X-axis to landmark in body XY plane
 
 ---
 
@@ -333,7 +338,8 @@ When `enable_prediction=false`:
 
 | Parameter | Type | Default | Effect |
 |-----------|------|---------|--------|
-| `R_camera` | float | 35.0 | Pixel noise variance. Lower = more trust in camera |
+| `R_range` | float | 0.1 | Range noise std (m). Lower = more trust in range |
+| `R_bearing` | float | 0.05 | Bearing noise std (rad). Lower = more trust in bearing |
 
 #### ZUPT Parameters
 
