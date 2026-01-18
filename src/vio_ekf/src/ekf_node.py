@@ -1144,14 +1144,13 @@ class EKFNode(Node):
         Fx = np.eye(15) + F * dt
 
         # ===================================================================
-        # STEP 3: Process Noise Covariance Q
+        # STEP 3: Process Noise Covariance Q (Van Loan Method)
         # ===================================================================
         # The process noise captures uncertainty from IMU sensor noise and bias drift.
+        # Using Van Loan method: Q = Fi @ Qc @ Fi.T
+        # where Fi maps noise sources to error states, and Qc is continuous noise.
         #
-        # Reference: MatthewHampsey/mekf kalman2.py process_covariance()
-        # Uses Van Loan method for proper discrete-time noise covariance.
-        #
-        # Simplified version with primary diagonal and key cross-terms:
+        # Reference: es_ekf.py and MatthewHampsey/mekf kalman2.py
 
         # ===================================================================
         # ADAPTIVE NOISE SCALING
@@ -1159,71 +1158,58 @@ class EKFNode(Node):
         # Scale process noise based on motion intensity:
         # - High acceleration/rotation → increase Q (less confidence in prediction)
         # - Low motion → decrease Q (more confidence in prediction)
-        # This prevents over-confidence during aggressive maneuvers and
-        # improves tracking during smooth motion.
 
         # Compute motion intensity metrics
         accel_intensity = np.linalg.norm(acc_body_clipped[0:2])  # XY acceleration magnitude
         gyro_intensity = abs(w_z)  # Yaw rate magnitude
 
         # Adaptive scaling factors (1.0 = nominal, higher = more noise)
-        # Ramp up noise when acceleration exceeds ~1 m/s² or yaw rate exceeds ~0.5 rad/s
         accel_scale = 1.0 + 2.0 * min(accel_intensity / 2.0, 2.0)  # Range: 1.0 to 5.0
         gyro_scale = 1.0 + 2.0 * min(gyro_intensity / 1.0, 2.0)    # Range: 1.0 to 5.0
 
-        # Apply scaling to base noise parameters
-        Q_a_adaptive = self.Q_a * accel_scale
-        Q_g_adaptive = self.Q_g * gyro_scale
-        Q_ba_adaptive = self.Q_ba * accel_scale  # Bias uncertainty also scales with motion
-        Q_bg_adaptive = self.Q_bg * gyro_scale
+        # Apply scaling to base noise parameters (continuous-time variances)
+        sigma_a2 = self.Q_a * accel_scale   # Accel noise variance
+        sigma_g2 = self.Q_g * gyro_scale    # Gyro noise variance
+        sigma_ba2 = self.Q_ba * dt          # Accel bias random walk (discrete)
+        sigma_bg2 = self.Q_bg * dt          # Gyro bias random walk (discrete)
 
-        # Build discrete process noise matrix Q for PLANAR robot
-        # Only XY position, XY velocity, yaw, XY accel bias, Z gyro bias are active
-        Qi = np.zeros((15, 15))
+        # ===================================================================
+        # Van Loan Noise Injection: Q = Fi @ Qc @ Fi.T
+        # ===================================================================
+        # Fi (15x12): Maps noise sources [n_a(3), n_g(3), n_ba(3), n_bg(3)] to error states
+        # For PLANAR robot: only XY accel, yaw gyro, XY accel bias, Z gyro bias active
 
-        # Position noise (XY only) - uses adaptive accel noise
-        Qi[0, 0] = Q_a_adaptive * (dt**4 / 4.0)  # px
-        Qi[1, 1] = Q_a_adaptive * (dt**4 / 4.0)  # py
-        # Z position has tiny noise (constrained)
-        Qi[2, 2] = 1e-10
+        Fi = np.zeros((15, 12), dtype=float)
 
-        # Velocity noise (XY only) - uses adaptive noise
-        Qi[3, 3] = Q_a_adaptive * dt + Q_ba_adaptive * (dt**3 / 3.0)  # vx
-        Qi[4, 4] = Q_a_adaptive * dt + Q_ba_adaptive * (dt**3 / 3.0)  # vy
-        # Z velocity has tiny noise (constrained)
-        Qi[5, 5] = 1e-10
+        # Accel noise → position and velocity (via rotation)
+        # δp += 0.5 * R_yaw * n_a * dt^2
+        # δv += R_yaw * n_a * dt (but we're in body frame, so just I*dt for body velocity)
+        Fi[0:2, 0:2] = 0.5 * R_yaw[0:2, 0:2] * (dt ** 2)  # n_a → δp (XY only)
+        Fi[3:5, 0:2] = np.eye(2) * dt                      # n_a → δv_b (XY only, body frame)
 
-        # Position-Velocity cross-correlation (XY only) - uses adaptive noise
-        Qi[0, 3] = Q_a_adaptive * (dt**3 / 2.0)
-        Qi[3, 0] = Qi[0, 3]
-        Qi[1, 4] = Q_a_adaptive * (dt**3 / 2.0)
-        Qi[4, 1] = Qi[1, 4]
+        # Gyro noise → orientation (yaw only)
+        # δθz += n_gz * dt
+        Fi[8, 5] = dt  # n_gz → δθz (index 5 in noise vector is gz)
 
-        # Orientation noise (YAW ONLY - index 8) - uses adaptive gyro noise
-        # Roll (6) and Pitch (7) are constrained to zero
-        Qi[6, 6] = 1e-10  # roll - constrained
-        Qi[7, 7] = 1e-10  # pitch - constrained
-        Qi[8, 8] = Q_g_adaptive * dt + Q_bg_adaptive * (dt**3 / 3.0)  # yaw
+        # Bias random walk (already discrete: sigma^2 * dt baked in)
+        Fi[9:11, 6:8] = np.eye(2)    # n_ba_xy → δba_xy
+        Fi[14, 11] = 1.0             # n_bg_z → δbg_z
 
-        # Yaw-Gyro bias z cross-correlation - uses adaptive noise
-        Qi[8, 14] = -Q_bg_adaptive * (dt**2 / 2.0)
-        Qi[14, 8] = Qi[8, 14]
+        # Continuous noise covariance Qc (12x12)
+        # Order: [n_ax, n_ay, n_az, n_gx, n_gy, n_gz, n_ba_x, n_ba_y, n_ba_z, n_bg_x, n_bg_y, n_bg_z]
+        Qc = np.diag([
+            sigma_a2, sigma_a2, 1e-12,     # Accel noise (XY active, Z tiny)
+            1e-12, 1e-12, sigma_g2,        # Gyro noise (Z active for yaw)
+            sigma_ba2, sigma_ba2, 1e-12,   # Accel bias RW (XY active, Z locked)
+            1e-12, 1e-12, sigma_bg2        # Gyro bias RW (Z active for yaw)
+        ]).astype(float)
 
-        # Accel bias random walk (XY only, Z locked) - uses adaptive noise
-        Qi[9, 9] = Q_ba_adaptive * dt    # ba_x
-        Qi[10, 10] = Q_ba_adaptive * dt  # ba_y
-        Qi[11, 11] = 1e-10               # ba_z - locked (unobservable)
+        # Process noise via Van Loan method
+        Qi = Fi @ Qc @ Fi.T
 
-        # Velocity-Accel bias cross-correlation (XY only) - uses adaptive noise
-        Qi[3, 9] = -Q_ba_adaptive * (dt**2 / 2.0)
-        Qi[9, 3] = Qi[3, 9]
-        Qi[4, 10] = -Q_ba_adaptive * (dt**2 / 2.0)
-        Qi[10, 4] = Qi[4, 10]
-
-        # Gyro bias random walk (Z only for planar - yaw) - uses adaptive noise
-        Qi[12, 12] = 1e-10             # bg_x - not used for planar
-        Qi[13, 13] = 1e-10             # bg_y - not used for planar
-        Qi[14, 14] = Q_bg_adaptive * dt  # bg_z - yaw gyro bias
+        # Ensure tiny noise on constrained states for numerical stability
+        for idx in [2, 5, 6, 7, 11, 12, 13]:  # pz, vz, roll, pitch, ba_z, bg_x, bg_y
+            Qi[idx, idx] = max(Qi[idx, idx], 1e-12)
 
         # ===================================================================
         # STEP 4: Covariance Update
@@ -1794,6 +1780,29 @@ class EKFNode(Node):
 
         # Keep ba_z locked (unobservable for planar)
         self.x[12] = 0.0
+
+        # ===================================================================
+        # G·P·G^T COVARIANCE RESET AFTER ERROR INJECTION
+        # ===================================================================
+        # After injecting error state δx into nominal state, the error state
+        # is reset to zero. The covariance must be updated accordingly:
+        #   P_new = G @ P @ G^T
+        # where G is the Jacobian of the reset operation.
+        #
+        # For most states, G = I (linear injection).
+        # For quaternion (right-multiplicative): G_θ = I - 0.5*[δθ]×
+        # Since we just applied small δθ, use: G_θ ≈ I - 0.5*[ori_correction]×
+        #
+        # Reference: Sola "Quaternion kinematics for ESKF", Section 7.2
+
+        G = np.eye(15)
+        # Orientation block reset Jacobian
+        if ori_corr_norm > 1e-8:
+            G[6:9, 6:9] = np.eye(3) - 0.5 * skew_symmetric(ori_correction)
+
+        # Apply covariance reset
+        self.P = G @ self.P @ G.T
+        self.P = 0.5 * (self.P + self.P.T)  # Ensure symmetry
 
         # --- GROUND ROBOT CONSTRAINTS (post-update) ---
         # Per recommendation2.md: When zeroing state, also zero corresponding covariance
