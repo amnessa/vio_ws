@@ -599,27 +599,10 @@ class EKFNode(Node):
         # Ground constraint: Z position should be 0
         self.x[2] = 0.0
 
-        # CRITICAL FIX: Reset biases when they're saturated!
-        # If biases hit their limits, the filter was already diverging and the
-        # bias estimates are garbage. Using saturated biases corrupts the
-        # gravity-based orientation estimate, causing immediate re-divergence.
-        MAX_ACCEL_BIAS = 0.5
-        MAX_GYRO_BIAS = 0.1
-
-        # Check if biases are near saturation (within 10% of limit)
-        accel_bias_saturated = np.any(np.abs(self.x[10:13]) > MAX_ACCEL_BIAS * 0.9)
-        gyro_bias_saturated = np.any(np.abs(self.x[13:16]) > MAX_GYRO_BIAS * 0.9)
-
-        if accel_bias_saturated or gyro_bias_saturated:
-            self.get_logger().warn("Biases saturated! Resetting to zero for clean recovery.")
-            self.x[10:13] = 0.0  # Reset accel bias
-            self.x[13:16] = 0.0  # Reset gyro bias
-        else:
-            # Keep reasonable biases but clip just in case
-            self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
-            self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
-            self.get_logger().info(f"Keeping biases: accel=[{self.x[10]:.3f}, {self.x[11]:.3f}, {self.x[12]:.3f}], "
-                                   f"gyro=[{self.x[13]:.4f}, {self.x[14]:.4f}, {self.x[15]:.4f}]")
+        # Keep current bias estimates - let the EKF covariance handle uncertainty
+        # Resetting biases loses valuable calibration information
+        self.get_logger().info(f"Keeping biases: accel=[{self.x[10]:.3f}, {self.x[11]:.3f}, {self.x[12]:.3f}], "
+                               f"gyro=[{self.x[13]:.4f}, {self.x[14]:.4f}, {self.x[15]:.4f}]")
 
         # Expand covariance to reflect uncertainty after reset
         self.P[0:3, 0:3] = np.eye(3) * 1.0    # Position uncertainty
@@ -772,10 +755,6 @@ class EKFNode(Node):
             bias_correction = bias_correction * (MAX_BIAS_CORR / bias_corr_norm)
 
         self.x[9:11] += bias_correction
-
-        # Clip biases to reasonable range
-        MAX_ACCEL_BIAS = 0.5
-        self.x[9:11] = np.clip(self.x[9:11], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
 
         # Log significant corrections
         if bias_corr_norm > 0.01:
@@ -1018,14 +997,6 @@ class EKFNode(Node):
         acc_body_clipped = np.clip(acc_body, -MAX_ACCEL, MAX_ACCEL)
         acc_body_clipped[2] = 0.0  # Ensure Z stays zero after clipping
 
-        acc_body_norm = np.linalg.norm(acc_body)
-
-        # --- Divergence Watchdog ---
-        if acc_body_norm > 20.0:  # Increased threshold - let filter work
-            self.get_logger().error(f"Filter Divergence! Body Accel: {acc_body_norm:.1f} m/s^2. Re-initializing from IMU...")
-            self._reinitialize_orientation(a_m, w_m)
-            return
-
         # Debug logging (every ~2 seconds at 200Hz)
         if not hasattr(self, '_debug_counter'):
             self._debug_counter = 0
@@ -1098,19 +1069,9 @@ class EKFNode(Node):
 
         # --- Bias Update (Random Walk Model) ---
         # Biases are constant in the prediction step (drift added via process noise)
+        # No clipping - let EKF covariance naturally bound bias estimates
         ba_new = ba.copy()
         bg_new = bg.copy()
-
-        # --- BIAS MAGNITUDE LIMITS ---
-        # Prevent biases from growing to unrealistic values
-        # Realistic accelerometer bias: < 0.5 m/s² (typical MEMS IMU)
-        # Realistic gyroscope bias: < 0.1 rad/s (~5 deg/s)
-        MAX_ACCEL_BIAS = 0.5  # m/s²
-        MAX_GYRO_BIAS = 0.1   # rad/s
-
-        ba_new = np.clip(ba_new, -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
-        bg_new = np.clip(bg_new, -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
-
 
         # Update Nominal State
         self.x[0:3] = p_new
@@ -1813,23 +1774,13 @@ class EKFNode(Node):
             q_updated = (R.from_quat([q[1], q[2], q[3], q[0]]) * delta_q).as_quat()
             self.x[6:10] = np.array([q_updated[3], q_updated[0], q_updated[1], q_updated[2]])
 
-        # Bias corrections (from cross-correlations) - with limits
-        bias_correction = dx[9:12]
-        if np.linalg.norm(bias_correction) > 0.01:  # Limit accel bias change
-            bias_correction = bias_correction * (0.01 / np.linalg.norm(bias_correction))
-        self.x[10:13] += bias_correction
+        # Bias corrections (from cross-correlations)
+        # No clipping - trust the Kalman gain computed from covariance
+        self.x[10:13] += dx[9:12]   # Accel bias correction
+        self.x[13:16] += dx[12:15]  # Gyro bias correction
 
-        gyro_bias_correction = dx[12:15]
-        if np.linalg.norm(gyro_bias_correction) > 0.005:  # Limit gyro bias change
-            gyro_bias_correction = gyro_bias_correction * (0.005 / np.linalg.norm(gyro_bias_correction))
-        self.x[13:16] += gyro_bias_correction
-
-        # Enforce bias magnitude limits (physical bounds)
-        MAX_ACCEL_BIAS = 0.5  # m/s²
-        MAX_GYRO_BIAS = 0.1   # rad/s
-        self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
-        self.x[13:16] = np.clip(self.x[13:16], -MAX_GYRO_BIAS, MAX_GYRO_BIAS)
-        self.x[12] = 0.0  # Keep ba_z locked
+        # Keep ba_z locked (unobservable for planar)
+        self.x[12] = 0.0
 
         # --- GROUND ROBOT CONSTRAINTS (post-update) ---
         # Per recommendation2.md: When zeroing state, also zero corresponding covariance
