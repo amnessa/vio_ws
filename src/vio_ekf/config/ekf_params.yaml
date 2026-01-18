@@ -23,7 +23,7 @@ ekf_node:
     # ==========================================================================
     # Enable/disable prediction step (IMU propagation)
     # When false, uses synthetic "frozen" prediction instead (see below)
-    enable_prediction: true
+    enable_prediction: false
 
     # Enable/disable correction step (camera measurement updates)
     enable_correction: true

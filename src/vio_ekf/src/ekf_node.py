@@ -57,8 +57,9 @@ class EKFNode(Node):
         self.declare_parameter('sigma_accel_bias', 0.01)  # sqrt(Q_ba)
         self.declare_parameter('sigma_gyro_bias', 0.01)  # sqrt(Q_bg)
 
-        # Measurement noise parameters (R)
-        self.declare_parameter('R_camera', 35.0)
+        # Measurement noise parameters (R) - Range-Bearing model
+        self.declare_parameter('R_range', 0.1)      # Range noise std (m)
+        self.declare_parameter('R_bearing', 0.05)   # Bearing noise std (rad)
         self.declare_parameter('R_zupt_velocity', 0.001)
 
         # ZUPT parameters
@@ -139,11 +140,14 @@ class EKFNode(Node):
         sigma_bg = self.get_parameter('sigma_gyro_bias').value
         self.Q_ba = sigma_ba ** 2  # Accel bias random walk
         self.Q_bg = sigma_bg ** 2  # Gyro bias random walk
-        self.R_cam = self.get_parameter('R_camera').value
+
+        # Range-Bearing measurement noise
+        self.R_range = self.get_parameter('R_range').value ** 2    # Variance (m²)
+        self.R_bearing = self.get_parameter('R_bearing').value ** 2  # Variance (rad²)
 
         self.get_logger().info(f"Process Noise: sigma_a={self.sigma_a}, sigma_g={self.sigma_g}")
         self.get_logger().info(f"Bias Walk: Q_ba={self.Q_ba:.2e}, Q_bg={self.Q_bg:.2e}")
-        self.get_logger().info(f"Measurement Noise: R_camera={self.R_cam}")
+        self.get_logger().info(f"Measurement Noise: R_range={np.sqrt(self.R_range):.3f}m, R_bearing={np.sqrt(self.R_bearing):.3f}rad")
 
         # ZUPT (Zero-Velocity Update) parameters
         # Per recommend.md Section 5: Trigger ZUPT based solely on gyro activity
@@ -1297,15 +1301,17 @@ class EKFNode(Node):
 
     def vision_callback(self, msg):
         """
-        Handle visual landmark observations with BATCH update.
+        Handle visual landmark observations using RANGE-BEARING model.
 
-        Per recommendation2.md: Instead of calling update() for each marker,
-        stack all visible markers into a single batch measurement and update
-        the filter once. This ensures all landmarks contribute to a single
-        consistent correction, avoiding linearization errors from sequential updates.
+        Instead of pixel coordinates, we compute range (distance) and bearing (angle)
+        to each detected ArUco marker and perform sequential EKF updates.
 
-        Per recommend.md: Use state buffer to find pose at image capture time,
-        not current time, to avoid linearization errors from motion during delay.
+        The ArUco detector provides:
+          - msg.poses[i].position.x = pixel u coordinate
+          - msg.poses[i].position.y = pixel v coordinate
+          - msg.poses[i].position.z = landmark ID
+
+        We convert pixel coordinates to range-bearing using camera geometry.
         """
         # Skip if correction is disabled
         if not self.enable_correction:
@@ -1320,463 +1326,223 @@ class EKFNode(Node):
             self.get_logger().warn("Vision update skipped: No IMU data received yet", throttle_duration_sec=2.0)
             return
 
-        vision_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        time_diff = abs(vision_time - self.last_imu_time)
-
-        # --- Find buffered state closest to image timestamp ---
-        # Per recommend.md: Calculate residual using pose at image capture time
-        buffered_state = None
-        if len(self.state_buffer) > 0:
-            # Find state with timestamp closest to vision_time
-            min_dt = float('inf')
-            for state in self.state_buffer:
-                dt = abs(state['time'] - vision_time)
-                if dt < min_dt:
-                    min_dt = dt
-                    buffered_state = state
-
-            # Only use buffer if we found a reasonably close match
-            if min_dt > self.max_time_delay:
-                self.get_logger().warn(
-                    f"Vision-IMU time mismatch: {time_diff:.3f}s. Using current state.",
-                    throttle_duration_sec=5.0
-                )
-                buffered_state = None
-
-        # Collect all valid observations for batch update
-        observations = []
+        # Process each detected landmark
+        update_count = 0
         for obs in msg.poses:
             lid = obs.position.z
-            u_meas = obs.position.x
-            v_meas = obs.position.y
+            u_meas = obs.position.x  # Pixel u
+            v_meas = obs.position.y  # Pixel v
 
-            if lid in self.map:
-                observations.append({
-                    'lm_pos': self.map[lid],
-                    'u': u_meas,
-                    'v': v_meas,
-                    'id': lid
-                })
+            if lid not in self.map:
+                continue
 
-        # Perform batch update only with 2+ markers for observability
-        # Single-marker updates cause position-yaw coupling errors and are the
-        # primary cause of "6km jumps" in high-drift states
-        if len(observations) >= 2:
-            self.batch_update(observations, buffered_state)
-        elif len(observations) == 1:
-            self.get_logger().info(
-                f"Skipping single-marker update (ID={observations[0]['id']:.0f}) - need 2+ for observability",
-                throttle_duration_sec=1.0
-            )
+            lm_world = self.map[lid]
 
-    def batch_update(self, observations, buffered_state=None):
-        """
-        ITERATED EKF (IEKF) batch update using all visible landmarks.
+            # Compute range and bearing from pixel measurement
+            # Use camera intrinsics to get normalized image coordinates
+            # Then compute bearing from camera geometry
+            fx = self.K[0, 0]
+            fy = self.K[1, 1]
+            cx = self.K[0, 2]
+            cy = self.K[1, 2]
 
-        Standard EKF linearizes once at the prior estimate, which fails for large
-        residuals (650+ pixels). IEKF iterates: re-linearize at updated estimate
-        until convergence, effectively performing Gauss-Newton optimization.
+            # Normalized image coordinates (ray direction in camera frame)
+            x_norm = (u_meas - cx) / fx
+            y_norm = (v_meas - cy) / fy
 
-        Args:
-            observations: List of dicts with 'lm_pos', 'u', 'v', 'id'
-            buffered_state: Optional state dict from buffer matching image timestamp
-        """
-        n_obs = len(observations)
-        if n_obs == 0:
-            return
+            # Bearing in camera frame: angle from optical axis (Z) to ray in XZ plane
+            # Camera frame: Z = forward (depth), X = right, Y = down
+            # Bearing = atan2(X, Z) where Z = 1 for normalized coords
+            bearing_camera = np.arctan2(x_norm, 1.0)
 
-        # Store original state for potential rollback
-        x_orig = self.x.copy()
-        P_orig = self.P.copy()
-
-        # Use buffered covariance if available
-        if buffered_state is not None:
-            P_prior = buffered_state['P'].copy()
-        else:
-            P_prior = self.P.copy()
-
-        # IEKF iteration parameters
-        MAX_ITERATIONS = 1
-        CONVERGENCE_THRESHOLD = 0.01  # meters for position, radians for orientation
-
-        # Working state for iterations (start from current estimate)
-        x_iter = self.x.copy()
-
-        for iteration in range(MAX_ITERATIONS):
-            # Extract current iteration state
-            p_w = x_iter[0:3]
-            q_w = x_iter[6:10]  # [w,x,y,z]
+            # To get range, we need the actual 3D position from the known map
+            # Transform landmark to body frame to compute true range
+            p_w = self.x[0:3]
+            q_w = self.x[6:10]  # [w, x, y, z]
             R_wb = R.from_quat([q_w[1], q_w[2], q_w[3], q_w[0]]).as_matrix()
 
-            # Build measurement model at current linearization point
-            z_res_stack = []
-            H_stack = []
-            valid_count = 0
+            # Landmark in body frame
+            lm_body = R_wb.T @ (lm_world - p_w)
 
-            for obs in observations:
-                lm_pos_world = obs['lm_pos']
-                u_meas = obs['u']
-                v_meas = obs['v']
-                lm_id = obs.get('id', -1)
+            # Transform to camera frame (account for camera extrinsics)
+            lm_cam = self.R_b_c @ (lm_body - self.t_b_c)
 
-                # --- First-Estimate Jacobians (FEJ) for orientation part ---
-                # Store first estimate for new landmarks (for logging only now)
-                if lm_id not in self.landmark_first_estimates:
-                    self.landmark_first_estimates[lm_id] = {
-                        'p': p_w.copy(),
-                        'R': R_wb.copy()
-                    }
-                    if iteration == 0:
-                        self.get_logger().info(f"FEJ: First observation of LM{int(lm_id)}, storing pose")
+            # Check if landmark is in front of camera
+            if lm_cam[2] < 0.1:
+                continue
 
-                # FIX: Use CURRENT rotation for Jacobian, not FEJ
-                # FEJ causes divergence when current yaw deviates from first-yaw:
-                # the Jacobian no longer points in the correct gradient direction
-                # R_fej = self.landmark_first_estimates[lm_id]['R']  # DISABLED
+            # Predicted range and bearing
+            # For planar: use XY distance (ignore Z)
+            pred_range = np.linalg.norm(lm_body[0:2])
+            if pred_range < 0.3:
+                continue  # Too close
 
-                # Transform World -> Body using CURRENT iteration state
-                p_b = R_wb.T @ (lm_pos_world - p_w)
+            # Bearing in body frame (angle from X axis to landmark in XY plane)
+            pred_bearing = np.arctan2(lm_body[1], lm_body[0])
 
-                # Transform Body -> Camera Optical Frame
-                p_c = self.R_b_c @ (p_b - self.t_b_c)
+            # Measured bearing: transform from camera frame to body frame
+            # Camera X = -Body Y, Camera Z = Body X
+            # So bearing_body = atan2(-x_norm, 1) in body coords
+            # Simplification: bearing in body = -bearing in camera (for forward-facing camera)
+            meas_bearing = -bearing_camera
 
-                # Skip if behind camera
-                if p_c[2] < 0.1:
-                    continue
+            # For range measurement, use the known landmark position and bearing
+            # to triangulate. Since we have the map, we use predicted range
+            # but with added measurement noise based on pixel uncertainty.
+            #
+            # Alternative: Use depth from stereo or known marker size
+            # For now, we trust the predicted range (from map) but the bearing
+            # comes from the actual pixel measurement
+            meas_range = pred_range  # Use map distance (could be from marker size)
 
-                # Project to pixels
-                u_pred = self.K[0,0] * p_c[0]/p_c[2] + self.K[0,2]
-                v_pred = self.K[1,1] * p_c[1]/p_c[2] + self.K[1,2]
+            # Perform range-bearing update
+            self.range_bearing_update(lm_world, meas_range, meas_bearing, lid)
+            update_count += 1
 
-                # Residual
-                z_res = np.array([u_meas - u_pred, v_meas - v_pred])
-
-                # GATE large residuals - reject observations with > 100px error
-                # These indicate wrong data association or severely wrong state estimate
-                residual_norm = np.linalg.norm(z_res)
-                if residual_norm > 100.0:
-                    if iteration == 0:
-                        self.get_logger().warn(
-                            f"  LM{int(lm_id)}: REJECTED (res={residual_norm:.0f}px > 100px gate)",
-                            throttle_duration_sec=0.5
-                        )
-                    continue  # Skip this observation
-
-                # Log on first iteration only
-                if iteration == 0:
-                    self.get_logger().info(
-                        f"  LM{int(lm_id)}: world={lm_pos_world}, p_c=[{p_c[0]:.2f},{p_c[1]:.2f},{p_c[2]:.2f}], "
-                        f"pred=({u_pred:.0f},{v_pred:.0f}), meas=({u_meas:.0f},{v_meas:.0f}), "
-                        f"res=[{z_res[0]:.0f},{z_res[1]:.0f}]px",
-                        throttle_duration_sec=0.5
-                    )
-
-                # Jacobian of Projection
-                fx = self.K[0,0]
-                fy = self.K[1,1]
-                X, Y, Z = p_c
-                J_proj = np.array([
-                    [fx/Z, 0, -fx*X/Z**2],
-                    [0, fy/Z, -fy*Y/Z**2]
-                ])
-
-                # Jacobian w.r.t Position (use CURRENT rotation, not FEJ)
-                J_pos = -self.R_b_c @ R_wb.T
-
-                # Assemble H (2x15) for this landmark - POSITION ONLY
-                H = np.zeros((2, 15))
-                H[:, 0:3] = J_proj @ J_pos
-
-                z_res_stack.append(z_res)
-                H_stack.append(H)
-                valid_count += 1
-
-            if valid_count == 0:
-                return
-
-            # Enforce 2+ marker requirement
-            if valid_count < 2:
-                self.get_logger().info(
-                    f"Skipping update: only {valid_count} valid marker(s) after filtering",
-                    throttle_duration_sec=1.0
-                )
-                return
-
-            # Stack into matrices
-            z_res_all = np.concatenate(z_res_stack)
-            H_all = np.vstack(H_stack)
-            R_all = np.eye(2 * valid_count) * self.R_cam
-
-            # IEKF uses prior covariance, not updated covariance
-            S = H_all @ P_prior @ H_all.T + R_all
-            S = 0.5 * (S + S.T) + np.eye(S.shape[0]) * 1e-6
-
-            try:
-                S_inv = np.linalg.inv(S)
-            except np.linalg.LinAlgError:
-                self.get_logger().warn("Singular S matrix in IEKF, skipping")
-                return
-
-            # Compute Kalman gain using PRIOR covariance
-            K = P_prior @ H_all.T @ S_inv
-
-            # Compute state correction
-            dx = K @ z_res_all
-
-            # # CRITICAL: Vision observes POSITION ONLY.
-            # # Zero out all other corrections - they come from P cross-correlations,
-            # # NOT from actual observability. Allowing these phantom corrections
-            # # corrupts orientation → gravity cancellation fails → divergence.
-            # dx[3:6] = 0.0   # Velocity - not directly observed
-            # dx[6:9] = 0.0   # Orientation - not observed
-            # dx[9:15] = 0.0  # Biases - not observed
-
-            # Apply correction to iteration state (position only now)
-            x_iter[0:3] += dx[0:3]  # Position
-
-            # Check convergence
-            pos_change = np.linalg.norm(dx[0:3])
-
-            if iteration > 0 and pos_change < CONVERGENCE_THRESHOLD:
-                self.get_logger().info(
-                    f"IEKF converged in {iteration+1} iterations, final residual={np.linalg.norm(z_res_all)/np.sqrt(valid_count):.1f}px",
-                    throttle_duration_sec=1.0
-                )
-                break
-
-        # After iteration, check if result is reasonable
-        total_pos_correction = np.linalg.norm(x_iter[0:3] - x_orig[0:3])
-        pixel_residual = np.linalg.norm(z_res_all) / np.sqrt(valid_count)
-
-        # Sanity check on position correction - allow larger corrections for recovery
-        # Too small = filter can never recover from drift
-        # Too large = bad measurements cause jumps
-        MAX_TOTAL_POS = 1.5  # Allow up to 1.5m correction to enable recovery
-
-        if total_pos_correction > MAX_TOTAL_POS:
-            self.get_logger().warn(
-                f"IEKF correction too large: pos={total_pos_correction:.2f}m > {MAX_TOTAL_POS}m. REJECTING update."
+        if update_count > 0:
+            self.get_logger().info(
+                f"Vision: {update_count} landmarks updated",
+                throttle_duration_sec=0.5
             )
-            # Restore original state and covariance - don't apply bad update
-            self.x = x_orig.copy()
-            self.P = P_orig.copy()
-            return
 
-        # Track this correction for vision-based motion detection
-        # If we're making significant corrections, robot is moving
-        self.last_vision_correction = total_pos_correction
-        if total_pos_correction > self.vision_motion_threshold:
-            self.vision_motion_cooldown = 100  # ~0.5s at 200Hz - don't ZUPT for a while
+    def range_bearing_update(self, lm_world, meas_range, meas_bearing, lm_id):
+        """
+        EKF measurement update using range-bearing model.
 
-        # Apply final state - POSITION ONLY
-        self.x[0:3] = x_iter[0:3]
-        # Velocity and orientation unchanged (vision doesn't observe them directly)
+        Measurement model:
+          z = [range, bearing]
+          range = ||lm_body[0:2]||  (planar distance)
+          bearing = atan2(lm_body[1], lm_body[0])  (angle in body XY plane)
 
-        # # Update covariance - but ONLY for position states
-        # # Zero out K rows for unobserved states to prevent false certainty
-        # K_masked = K.copy()
-        # K_masked[3:, :] = 0.0  # Zero velocity, orientation, bias rows
+        where lm_body = R_wb^T @ (lm_world - p_w)
 
-        I = np.eye(15)
-        # IKH = I - K_masked @ H_all
-        IKH = I - K @ H_all
-        # self.P = IKH @ P_prior @ IKH.T + K_masked @ R_all @ K_masked.T
-        self.P = IKH @ P_prior @ IKH.T + K @ R_all @ K.T
-        self.P = 0.5 * (self.P + self.P.T)
-        min_eig = np.min(np.diag(self.P))
-        if min_eig < 1e-10:
-            self.P += np.eye(15) * 1e-10
-
-        # Ground constraints
-        self.x[2] = 0.0  # Z position
-        self.x[5] = 0.0  # Z velocity (body frame)
-
-        # Apply soft Z-constraint to covariance
-        z_damping = 0.5
-        self.P[2, :] *= z_damping
-        self.P[:, 2] *= z_damping
-        self.P[5, :] *= z_damping
-        self.P[:, 5] *= z_damping
-        self.P[2, 2] = max(self.P[2, 2], 1e-4)
-        self.P[5, 5] = max(self.P[5, 5], 1e-4)
-
-        # Removed 0.5 m/s speed clamping - let filter dynamics and prediction limit handle this
-
-        # Log update
-        q = self.x[6:10]
-        yaw = R.from_quat([q[1], q[2], q[3], q[0]]).as_euler('zyx')[0]
-        self.get_logger().info(
-            f"IEKF UPDATE ({valid_count} markers, {iteration+1} iters): pos=[{self.x[0]:.2f}, {self.x[1]:.2f}]m, "
-            f"yaw={np.degrees(yaw):.1f}°, residual={pixel_residual:.1f}px",
-            throttle_duration_sec=0.5
-        )
-
-    def update(self, lm_pos_world, u_meas, v_meas):
-        # --- UPDATE STEP ---
-        self.get_logger().info(f"Vision update! Landmark at {lm_pos_world}")
-        # 1. Project Map Point to Camera
+        Args:
+            lm_world: 3D landmark position in world frame
+            meas_range: Measured range to landmark (m)
+            meas_bearing: Measured bearing to landmark (rad)
+            lm_id: Landmark ID for logging
+        """
+        # Current state
         p_w = self.x[0:3]
-        q_w = self.x[6:10] # [w,x,y,z]
+        q_w = self.x[6:10]  # [w, x, y, z]
         R_wb = R.from_quat([q_w[1], q_w[2], q_w[3], q_w[0]]).as_matrix()
 
-        # Transform World -> Body
-        # p_b = R_wb^T * (p_lm - p_w)
-        p_b = R_wb.T @ (lm_pos_world - p_w)
+        # Transform landmark to body frame
+        lm_body = R_wb.T @ (lm_world - p_w)
 
-        # Transform Body -> Camera Optical Frame
-        # p_c = R_b_c @ (p_b - t_b_c)
-        # This is correct: first translate to camera origin, then rotate to optical frame
-        p_c = self.R_b_c @ (p_b - self.t_b_c)
+        # Predicted range and bearing (planar)
+        pred_range = np.linalg.norm(lm_body[0:2])
+        if pred_range < 0.3:
+            return  # Too close, skip
 
-        # Check if behind camera (Z in optical frame is depth)
-        if p_c[2] < 0.1: return
+        pred_bearing = np.arctan2(lm_body[1], lm_body[0])
 
-        # Project to pixels
-        # [u, v, 1]^T = K * p_c / z
-        u_pred = self.K[0,0] * p_c[0]/p_c[2] + self.K[0,2]
-        v_pred = self.K[1,1] * p_c[1]/p_c[2] + self.K[1,2]
+        # Measurement residual
+        range_res = meas_range - pred_range
+        bearing_res = meas_bearing - pred_bearing
+        # Wrap bearing residual to [-π, π]
+        bearing_res = np.arctan2(np.sin(bearing_res), np.cos(bearing_res))
 
-        # Residual
-        z_res = np.array([u_meas - u_pred, v_meas - v_pred])
+        y = np.array([range_res, bearing_res])
 
-        # 2. Calculate Jacobian H (2x15)
-        # H = d(res)/d(x) = d(res)/d(pc) * d(pc)/d(x)
+        # ===================================================================
+        # Jacobian H (2x15) for range-bearing measurement
+        # ===================================================================
+        # Measurement is function of lm_body = R_wb^T @ (lm_world - p_w)
+        #
+        # d(lm_body)/d(p_w) = -R_wb^T
+        # d(lm_body)/d(θ) = [lm_body]× (skew of landmark in body frame)
+        #
+        # For range r = ||lm_body[0:2]||:
+        #   dr/d(lm_body) = [lm_body[0]/r, lm_body[1]/r, 0]
+        #
+        # For bearing b = atan2(lm_body[1], lm_body[0]):
+        #   db/d(lm_body) = [-lm_body[1]/r², lm_body[0]/r², 0]
 
-        # Jacobian of Projection: d(uv)/d(pc)
-        fx = self.K[0,0]
-        fy = self.K[1,1]
-        X, Y, Z = p_c
-        J_proj = np.array([
-            [fx/Z, 0, -fx*X/Z**2],
-            [0, fy/Z, -fy*Y/Z**2]
-        ])
+        r = pred_range
+        lx, ly = lm_body[0], lm_body[1]
 
-        # Jacobian of Transform: d(pc)/d(x)
-        # Only dependence is on robot position and orientation
-        # p_c = R_bc * R_wb^T * (p_lm - p_w) - ...
+        # Jacobian of measurements w.r.t. lm_body (in 3D)
+        dr_dlm = np.array([lx / r, ly / r, 0.0])
+        db_dlm = np.array([-ly / (r**2), lx / (r**2), 0.0])
 
-        # w.r.t Position p_w:
-        # d(pc)/d(pw) = R_bc * R_wb^T * (-I)
-        J_pos = -self.R_b_c @ R_wb.T
+        # Jacobian w.r.t. position: d(lm_body)/d(p_w) = -R_wb^T
+        H_pos_range = dr_dlm @ (-R_wb.T)
+        H_pos_bearing = db_dlm @ (-R_wb.T)
 
-        # w.r.t Orientation theta (in body frame):
-        # DISABLED - vision updates position only, let IMU+ZUPT handle orientation
-        # d(pc)/d(theta) = R_bc * [p_b]_× (skew symmetric of point in body)
-        # J_rot = self.R_b_c @ skew_symmetric(p_b)
+        # Jacobian w.r.t. orientation: d(lm_body)/d(θ) = [lm_body]×
+        # Using right-multiplicative error convention
+        lm_body_skew = skew_symmetric(lm_body)
+        H_ori_range = dr_dlm @ lm_body_skew
+        H_ori_bearing = db_dlm @ lm_body_skew
 
-        # Assemble H (2x15) - POSITION ONLY
+        # Assemble H (2x15)
+        # Error state: [δp(3), δv(3), δθ(3), δba(3), δbg(3)]
         H = np.zeros((2, 15))
-        H[:, 0:3] = J_proj @ J_pos
-        # H[:, 6:9] = J_proj @ J_rot  # DISABLED
+        H[0, 0:3] = H_pos_range      # Range w.r.t. position
+        H[0, 6:9] = H_ori_range      # Range w.r.t. orientation
+        H[1, 0:3] = H_pos_bearing    # Bearing w.r.t. position
+        H[1, 6:9] = H_ori_bearing    # Bearing w.r.t. orientation
 
-        # 3. Kalman Update
-        # S = H P H.T + R
-        S = H @ self.P @ H.T + np.eye(2) * self.R_cam
+        # ===================================================================
+        # Kalman Update
+        # ===================================================================
+        # Measurement noise
+        Rm = np.diag([self.R_range, self.R_bearing])
 
-        # --- Outlier Gating ---
-        # For KNOWN landmarks, we should be more permissive
-        # Large residuals after long dead-reckoning are EXPECTED and should be corrected
+        # Innovation covariance
+        S = H @ self.P @ H.T + Rm
+
+        # Kalman gain
         try:
             S_inv = np.linalg.inv(S)
-            mahalanobis_sq = z_res @ S_inv @ z_res
         except np.linalg.LinAlgError:
             self.get_logger().warn("Singular S matrix, skipping update")
             return
 
-        pixel_residual = np.linalg.norm(z_res)
+        K = self.P @ H.T @ S_inv
 
-        # Handle numerical issues with Mahalanobis distance
-        if mahalanobis_sq < 0 or np.isnan(mahalanobis_sq):
-            self.get_logger().warn("Invalid Mahalanobis distance, skipping update")
-            return
-        mahal_dist = np.sqrt(mahalanobis_sq)
+        # Error state correction
+        dx = K @ y
 
-        # Adaptive gating: if covariance is large, allow larger corrections
-        # Chi-squared 99% for 2 DOF is 9.21, 99.9% is 13.82
-        # Since we KNOW landmark positions, we can be more aggressive
-        adaptive_threshold = max(self.mahalanobis_threshold, 10.0)
-
-        if mahal_dist > adaptive_threshold:
-            self.consecutive_outliers += 1
-
-            # Per recommendation2.md: Use robust M-estimator (Huber) instead of
-            # binary accept/reject. This down-weights outliers gracefully.
-            if self.consecutive_outliers >= self.max_consecutive_outliers:
-                # Instead of expanding covariance (which causes jumps),
-                # apply Huber-weighted update with reduced gain
-                huber_threshold = 3.0  # Standard Huber threshold
-                huber_weight = huber_threshold / mahal_dist  # < 1 for outliers
-                self.get_logger().warn(
-                    f"Robust update: Mahal={mahal_dist:.1f}, Huber weight={huber_weight:.2f}"
-                )
-                # Scale the innovation by Huber weight
-                z_res = z_res * huber_weight
-                self.consecutive_outliers = 0
-                # Continue with weighted update below (don't return)
-            else:
-                self.get_logger().warn(
-                    f"Outlier Rejected! Residual: {pixel_residual:.1f} px, "
-                    f"Mahal: {mahal_dist:.1f} (thresh={adaptive_threshold:.1f})"
-                )
-                return
-
-        # Good measurement - reset outlier counter
-        self.consecutive_outliers = 0
-
-        # Log successful updates for debugging
-        if pixel_residual > 20.0:
-            self.get_logger().info(f"Vision correction: {pixel_residual:.1f} px, Mahal: {mahal_dist:.1f}")
-
-        try:
-            K = self.P @ H.T @ S_inv
-        except np.linalg.LinAlgError:
-            return
-
-        # Error State Update
-        dx = K @ z_res
-
-        # Update Covariance (Joseph form for numerical stability)
+        # Update covariance (Joseph form for numerical stability)
         I = np.eye(15)
-        self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ (np.eye(2) * self.R_cam) @ K.T
+        IKH = I - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ Rm @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
 
-        # 4. Inject Error into Nominal State
-        # FIX: Do NOT zero out dx components!
-        # The P matrix contains cross-correlations. When vision corrects position,
-        # the correlations in P allow orientation/bias to also be corrected.
-        # Zeroing dx breaks covariance consistency and leaves errors untouched.
-        # Trust the Kalman gain K computed from P.
+        # ===================================================================
+        # Inject error into nominal state
+        # ===================================================================
 
         # Position correction (with limit for safety)
         pos_correction = dx[0:3]
         pos_corr_norm = np.linalg.norm(pos_correction)
         if pos_corr_norm > 0.5:
             pos_correction = pos_correction * (0.5 / pos_corr_norm)
-            self.get_logger().warn(f"Position correction clipped: {pos_corr_norm:.2f}m", throttle_duration_sec=1.0)
         self.x[0:3] += pos_correction
 
-        # Velocity correction (with limit for safety)
+        # Velocity correction (with limit)
         vel_correction = dx[3:6]
         vel_corr_norm = np.linalg.norm(vel_correction)
         if vel_corr_norm > 0.3:
             vel_correction = vel_correction * (0.3 / vel_corr_norm)
-            self.get_logger().warn(f"Velocity correction clipped: {vel_corr_norm:.2f}m/s", throttle_duration_sec=1.0)
         self.x[3:6] += vel_correction
 
-        # Orientation correction (from cross-correlations) - apply as axis-angle
+        # Orientation correction - apply as quaternion update
         ori_correction = dx[6:9]
         ori_corr_norm = np.linalg.norm(ori_correction)
-        if ori_corr_norm > 0.05:  # Limit to ~3 degrees per update
-            ori_correction = ori_correction * (0.05 / ori_corr_norm)
+        if ori_corr_norm > 0.1:  # Limit to ~6 degrees
+            ori_correction = ori_correction * (0.1 / ori_corr_norm)
         if ori_corr_norm > 1e-8:
             q = self.x[6:10]
             delta_q = R.from_rotvec(ori_correction)
             q_updated = (R.from_quat([q[1], q[2], q[3], q[0]]) * delta_q).as_quat()
             self.x[6:10] = np.array([q_updated[3], q_updated[0], q_updated[1], q_updated[2]])
 
-        # Bias corrections (from cross-correlations)
-        # No clipping - trust the Kalman gain computed from covariance
-        self.x[10:13] += dx[9:12]   # Accel bias correction
-        self.x[13:16] += dx[12:15]  # Gyro bias correction
+        # Bias corrections
+        self.x[10:13] += dx[9:12]   # Accel bias
+        self.x[13:16] += dx[12:15]  # Gyro bias
 
         # Keep ba_z locked (unobservable for planar)
         self.x[12] = 0.0
@@ -1784,62 +1550,24 @@ class EKFNode(Node):
         # ===================================================================
         # G·P·G^T COVARIANCE RESET AFTER ERROR INJECTION
         # ===================================================================
-        # After injecting error state δx into nominal state, the error state
-        # is reset to zero. The covariance must be updated accordingly:
-        #   P_new = G @ P @ G^T
-        # where G is the Jacobian of the reset operation.
-        #
-        # For most states, G = I (linear injection).
-        # For quaternion (right-multiplicative): G_θ = I - 0.5*[δθ]×
-        # Since we just applied small δθ, use: G_θ ≈ I - 0.5*[ori_correction]×
-        #
-        # Reference: Sola "Quaternion kinematics for ESKF", Section 7.2
-
         G = np.eye(15)
-        # Orientation block reset Jacobian
         if ori_corr_norm > 1e-8:
             G[6:9, 6:9] = np.eye(3) - 0.5 * skew_symmetric(ori_correction)
-
-        # Apply covariance reset
         self.P = G @ self.P @ G.T
-        self.P = 0.5 * (self.P + self.P.T)  # Ensure symmetry
+        self.P = 0.5 * (self.P + self.P.T)
 
-        # --- GROUND ROBOT CONSTRAINTS (post-update) ---
-        # Per recommendation2.md: When zeroing state, also zero corresponding covariance
-        # to prevent P mismatch (state forbidden to move but covariance grows)
-        self.x[2] = 0.0  # Z position = 0
-        self.x[5] = 0.0  # Z velocity = 0
-        self.x[12] = 0.0  # ba_z = 0 (unobservable)
+        # ===================================================================
+        # PLANAR CONSTRAINTS
+        # ===================================================================
+        self.x[2] = 0.0   # Z position = 0
+        self.x[5] = 0.0   # Z velocity = 0
+        self.x[12] = 0.0  # ba_z = 0
 
-        # Zero out Z covariance rows/columns to match state constraint
-        self.P[2, :] = 0.0
-        self.P[:, 2] = 0.0
-        self.P[2, 2] = 1e-6  # Small non-zero for numerical stability
-        self.P[5, :] = 0.0
-        self.P[:, 5] = 0.0
-        self.P[5, 5] = 1e-6
-        # Also lock ba_z covariance
-        self.P[11, :] = 0.0
-        self.P[:, 11] = 0.0
-        self.P[11, 11] = 1e-6
-
-        # Removed 0.5 m/s speed clamping - prediction step already has 2.0 m/s limit
-
-        # --- Log Robot Belief After Measurement Update ---
-        # Extract yaw from quaternion for readability
-        q = self.x[6:10]  # [w, x, y, z]
-        yaw = R.from_quat([q[1], q[2], q[3], q[0]]).as_euler('zyx')[0]
-        # Handle potential negative diagonal (use abs to avoid sqrt warning)
-        pos_diag = np.diag(self.P[0:3, 0:3])
-        pos_std = np.sqrt(np.maximum(pos_diag, 0.0))
-        ba = self.x[10:13]  # Accel bias
-        self.get_logger().info(
-            f"BELIEF: pos=[{self.x[0]:.2f}, {self.x[1]:.2f}]m, yaw={np.degrees(yaw):.1f}°, "
-            f"vel=[{self.x[3]:.2f}, {self.x[4]:.2f}]m/s, ba=[{ba[0]:.3f}, {ba[1]:.3f}]m/s²",
-            throttle_duration_sec=0.5
-        )
-
-        # Reset Error State (Implied dx=0 for next step)
+        # Zero constrained state covariances
+        for idx in [2, 5, 11]:  # pz, vz, ba_z
+            self.P[idx, :] = 0.0
+            self.P[:, idx] = 0.0
+            self.P[idx, idx] = 1e-6
 
     def publish_state(self, timestamp):
         # Publish Odometry
@@ -1896,10 +1624,6 @@ class EKFNode(Node):
         self.pub_path.publish(self.path_msg)
 
         # Publish Diagnostics for tuning/debugging
-        # Format: [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z,
-        #          P_pos_x, P_pos_y, P_pos_z, P_vel_x, P_vel_y, P_vel_z,
-        #          P_ori_x, P_ori_y, P_ori_z, P_ba_x, P_ba_y, P_ba_z, P_bg_x, P_bg_y, P_bg_z,
-        #          vx, vy, vz, speed, last_vision_correction]
         diag = Float64MultiArray()
         P_diag = np.diag(self.P)
         speed = np.linalg.norm(self.x[3:5])
@@ -1913,14 +1637,12 @@ class EKFNode(Node):
             float(P_diag[3]), float(P_diag[4]), float(P_diag[5]),
             # Covariance diagonal - orientation (3 values)
             float(P_diag[6]), float(P_diag[7]), float(P_diag[8]),
-            # Covariance diagonal - accel bias (3 values)
+            # Covariance diagonal - biases (6 values)
             float(P_diag[9]), float(P_diag[10]), float(P_diag[11]),
-            # Covariance diagonal - gyro bias (3 values)
             float(P_diag[12]), float(P_diag[13]), float(P_diag[14]),
-            # Velocity and speed (4 values)
-            float(self.x[3]), float(self.x[4]), float(self.x[5]), float(speed),
-            # Last vision correction magnitude (1 value)
-            float(self.last_vision_correction)
+            # Velocity + motion indicator (4 values)
+            float(self.x[3]), float(self.x[4]), float(self.x[5]),
+            float(speed), float(self.last_vision_correction)
         ]
         self.pub_diag.publish(diag)
 
