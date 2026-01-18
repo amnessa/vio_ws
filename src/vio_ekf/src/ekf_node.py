@@ -1503,6 +1503,15 @@ class EKFNode(Node):
         H[1, 0:3] = H_pos_bearing    # Bearing w.r.t. position
         H[1, 6:9] = H_ori_bearing    # Bearing w.r.t. orientation
 
+        # PLANAR CONSTRAINT: Zero out Z-position and Z-velocity columns
+        # The measurement does not depend on Z position (we only use XY range)
+        H[:, 2] = 0.0   # No dependence on p_z
+        H[:, 5] = 0.0   # No dependence on v_z
+
+        # Also zero out roll/pitch columns - only yaw affects planar bearing
+        # H[:, 6] = 0.0   # δθ_roll - keep for now, let covariance handle it
+        # H[:, 7] = 0.0   # δθ_pitch
+
         # ===================================================================
         # Kalman Update
         # ===================================================================
