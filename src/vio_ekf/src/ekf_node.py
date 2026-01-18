@@ -1371,29 +1371,39 @@ class EKFNode(Node):
             if lm_cam[2] < 0.1:
                 continue
 
-            # Predicted range and bearing
-            # For planar: use XY distance (ignore Z)
-            pred_range = np.linalg.norm(lm_body[0:2])
+            # Predicted range and bearing (PLANAR - XY only)
+            pred_range = np.linalg.norm(lm_body[0:2])  # XY distance only
             if pred_range < 0.3:
                 continue  # Too close
 
-            # Bearing in body frame (angle from X axis to landmark in XY plane)
+            # Bearing in body frame (angle from body X-axis to landmark in XY plane)
             pred_bearing = np.arctan2(lm_body[1], lm_body[0])
 
-            # Measured bearing: transform from camera frame to body frame
-            # Camera X = -Body Y, Camera Z = Body X
-            # So bearing_body = atan2(-x_norm, 1) in body coords
-            # Simplification: bearing in body = -bearing in camera (for forward-facing camera)
-            meas_bearing = -bearing_camera
-
-            # For range measurement, use the known landmark position and bearing
-            # to triangulate. Since we have the map, we use predicted range
-            # but with added measurement noise based on pixel uncertainty.
+            # ===================================================================
+            # MEASURED BEARING from pixel coordinates
+            # ===================================================================
+            # The pixel u-coordinate tells us the horizontal angle in camera frame.
+            # Camera optical frame: Z=forward, X=right, Y=down
+            # Body frame: X=forward, Y=left, Z=up
+            # Camera mounted facing forward: camera Z ≈ body X
             #
-            # Alternative: Use depth from stereo or known marker size
-            # For now, we trust the predicted range (from map) but the bearing
-            # comes from the actual pixel measurement
-            meas_range = pred_range  # Use map distance (could be from marker size)
+            # Bearing in camera XZ plane: atan2(x_norm, 1)
+            # To convert to body frame bearing (from body X-axis):
+            #   - Camera X (right) = -Body Y (left is positive in body)
+            #   - Camera Z (forward) = Body X (forward)
+            # So: body_bearing = atan2(-camera_x, camera_z) = atan2(-x_norm, 1)
+            meas_bearing = np.arctan2(-x_norm, 1.0)
+
+            # ===================================================================
+            # MEASURED RANGE from depth (camera Z coordinate)
+            # ===================================================================
+            # We can estimate range from the camera depth (lm_cam[2]) projected to XY:
+            # lm_cam[2] is depth along camera optical axis
+            # For a planar range, we use: range ≈ depth / cos(bearing_camera)
+            # Or simply use the XY projection of the camera-frame position
+            meas_range = np.linalg.norm(lm_cam[0:2])  # XY distance in camera frame
+            # Alternative: use predicted range (less informative but stable)
+            # meas_range = pred_range
 
             # Perform range-bearing update
             self.range_bearing_update(lm_world, meas_range, meas_bearing, lid)
@@ -1462,19 +1472,28 @@ class EKFNode(Node):
         r = pred_range
         lx, ly = lm_body[0], lm_body[1]
 
-        # Jacobian of measurements w.r.t. lm_body (in 3D)
-        dr_dlm = np.array([lx / r, ly / r, 0.0])
-        db_dlm = np.array([-ly / (r**2), lx / (r**2), 0.0])
+        # Jacobian of measurements w.r.t. lm_body XY components only (PLANAR)
+        # Since we use only XY for range and bearing, Z derivatives are zero
+        dr_dlm_xy = np.array([lx / r, ly / r])  # 2D gradient
+        db_dlm_xy = np.array([-ly / (r**2), lx / (r**2)])  # 2D gradient
 
         # Jacobian w.r.t. position: d(lm_body)/d(p_w) = -R_wb^T
-        H_pos_range = dr_dlm @ (-R_wb.T)
-        H_pos_bearing = db_dlm @ (-R_wb.T)
+        # We only need the XY rows of R_wb^T (2x3 submatrix)
+        R_wb_T = R_wb.T
+        R_wb_T_xy = R_wb_T[0:2, :]  # Take first 2 rows (X,Y in body)
+
+        H_pos_range = dr_dlm_xy @ (-R_wb_T_xy)    # 1x3
+        H_pos_bearing = db_dlm_xy @ (-R_wb_T_xy)  # 1x3
 
         # Jacobian w.r.t. orientation: d(lm_body)/d(θ) = [lm_body]×
         # Using right-multiplicative error convention
+        # For planar, we only care about yaw (rotation around Z)
+        # d(lm_body_xy)/d(θz) comes from the Z-column of [lm_body]×
         lm_body_skew = skew_symmetric(lm_body)
-        H_ori_range = dr_dlm @ lm_body_skew
-        H_ori_bearing = db_dlm @ lm_body_skew
+        lm_body_skew_xy = lm_body_skew[0:2, :]  # Take first 2 rows (XY)
+
+        H_ori_range = dr_dlm_xy @ lm_body_skew_xy    # 1x3
+        H_ori_bearing = db_dlm_xy @ lm_body_skew_xy  # 1x3
 
         # Assemble H (2x15)
         # Error state: [δp(3), δv(3), δθ(3), δba(3), δbg(3)]
@@ -1568,6 +1587,13 @@ class EKFNode(Node):
             self.P[idx, :] = 0.0
             self.P[:, idx] = 0.0
             self.P[idx, idx] = 1e-6
+
+        # Log update details
+        self.get_logger().debug(
+            f"RB Update LM{int(lm_id)}: r={meas_range:.2f}m, b={np.degrees(meas_bearing):.1f}°, "
+            f"res=[{y[0]:.3f}m, {np.degrees(y[1]):.1f}°]",
+            throttle_duration_sec=0.2
+        )
 
     def publish_state(self, timestamp):
         # Publish Odometry
