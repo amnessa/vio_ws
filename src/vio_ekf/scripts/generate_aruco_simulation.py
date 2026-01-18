@@ -3,7 +3,7 @@
 ArUco Marker Simulation Generator
 
 This script generates:
-1. 50 unique ArUco marker models for Gazebo (in ~/.gazebo/models/)
+1. 24 unique ArUco marker models for Gazebo (in ~/.gazebo/models/)
 2. A new world file (landmarks.sdf) with markers arranged in a grid
 3. Prints the map dictionary to paste into ekf_node.py
 

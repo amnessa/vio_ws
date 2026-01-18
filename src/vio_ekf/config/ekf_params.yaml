@@ -23,13 +23,13 @@ ekf_node:
     # ==========================================================================
     # Enable/disable prediction step (IMU propagation)
     # When false, uses synthetic "frozen" prediction instead (see below)
-    enable_prediction: false
+    enable_prediction: true
 
     # Enable/disable correction step (camera measurement updates)
     enable_correction: true
 
     # Enable/disable ZUPT (Zero-Velocity Update when stationary)
-    enable_zupt: false
+    enable_zupt: true
 
     # Enable/disable IMU lever-arm compensation
     # Compensates for centripetal acceleration when IMU is offset from body origin

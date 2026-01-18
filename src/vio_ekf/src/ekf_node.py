@@ -707,132 +707,81 @@ class EKFNode(Node):
 
     def _zupt_gravity_update(self, a_corrected):
         """
-        Formal EKF gravity measurement update for tilt correction.
+        PLANAR VERSION: Simplified gravity measurement for XY accel bias estimation.
 
-        Per recommend.md Section 1: Treat accelerometer as a TILT SENSOR during
-        stationary periods. When stationary, accelerometer should measure exactly
-        [0, 0, g] in world frame. The residual between measured and predicted
-        gravity direction provides orientation correction.
+        For a planar robot with roll/pitch = 0, the accelerometer z-axis should
+        measure exactly g when stationary. The XY components should measure zero.
 
-        This updates BOTH orientation AND covariance consistently, "locking" the
-        tilt and stopping gravity leakage before it integrates into velocity.
+        This update estimates XY accelerometer biases only (no orientation correction
+        since we enforce roll/pitch = 0 in the planar model).
 
-        Measurement model: The accelerometer reading should equal R^T @ g when stationary
-        where R is body-to-world rotation and g is gravity in world frame.
+        Measurement model (planar, stationary):
+          a_measured_xy = 0 + bias_xy  => bias_xy = a_measured_xy
+          a_measured_z = g + bias_z    => (bias_z locked to 0)
         """
-        # Current orientation
-        q = self.x[6:10]
-        rot = R.from_quat([q[1], q[2], q[3], q[0]])
-        R_wb = rot.as_matrix()
+        # For planar robot: XY acceleration should be zero when stationary
+        # The XY readings are directly the XY biases
+        a_xy = a_corrected[0:2]  # XY acceleration in body frame
 
-        # Expected accelerometer reading if orientation is correct:
-        # a_expected = R_wb^T @ g (gravity in body frame)
-        g_world = self.g  # [0, 0, g_magnitude]
-        a_expected = R_wb.T @ g_world
-
-        # Actual reading (bias-corrected)
-        a_measured = a_corrected
-
-        # Residual: difference between measured and expected
-        z_res = a_measured - a_expected
-
-        # Skip if residual is very small (already aligned)
-        if np.linalg.norm(z_res) < 0.05:
+        # Skip if XY residual is very small
+        if np.linalg.norm(a_xy) < 0.02:
             return
 
-        # Measurement Jacobian H (3x15)
-        # The measurement is a_meas = R^T @ g
-        # Derivative w.r.t. orientation error dθ:
-        #   d(R^T @ g)/d(dθ) = -[R^T @ g]_× = -skew(a_expected)
-        # This is because small rotation: R_new^T ≈ (I - [dθ]_×) @ R^T
-        # So: a_new ≈ (I - [dθ]_×) @ a_expected = a_expected - [dθ]_× @ a_expected
-        #           = a_expected + [a_expected]_× @ dθ
-        # Therefore: da/d(dθ) = [a_expected]_× = skew(a_expected)
-        #
-        # Also derivative w.r.t. accel bias: d(a_meas)/d(ba) = -I
-        # (since a_corrected = a_raw - ba)
+        # Measurement: a_xy should be zero when stationary
+        # Residual z = 0 - a_xy = -a_xy
+        z_res = -a_xy
 
-        H = np.zeros((3, 15))
-        H[0:3, 6:9] = skew_symmetric(a_expected)  # d/d(dθ)
-        H[0:3, 9:12] = -np.eye(3)  # d/d(dba) - accelerometer bias affects measurement
+        # Measurement Jacobian H (2x15)
+        # Only XY accel bias affects XY accelerometer reading
+        # d(a_xy)/d(ba_xy) = -I  (since a_corrected = a_raw - ba)
+        H = np.zeros((2, 15))
+        H[0, 9] = -1.0   # d(ax)/d(ba_x)
+        H[1, 10] = -1.0  # d(ay)/d(ba_y)
 
-        # Measurement noise
-        R_gravity = np.eye(3) * self.R_zupt_gravity
+        # Measurement noise (XY gravity/bias)
+        R_gravity_xy = np.eye(2) * self.R_zupt_gravity
 
         # Innovation covariance
-        S = H @ self.P @ H.T + R_gravity
+        S = H @ self.P @ H.T + R_gravity_xy
 
-        # Check for reasonable innovation
+        # Kalman gain
         try:
             S_inv = np.linalg.inv(S)
-            mahal_sq = z_res @ S_inv @ z_res
         except np.linalg.LinAlgError:
             self.get_logger().warn("ZUPT gravity update: Singular S matrix")
             return
 
-        # Outlier rejection (very high residual indicates something wrong)
-        # BUT: Don't reject too aggressively - orientation NEEDS correction!
-        # If we reject, the filter can never recover from bad orientation.
-        # Instead, apply the correction but limit its magnitude.
-        MAHAL_HARD_REJECT = 1000.0  # Only reject truly crazy values
-        MAHAL_LIMIT_CORRECTION = 100.0  # Limit correction above this
-
-        if mahal_sq > MAHAL_HARD_REJECT:
-            self.get_logger().warn(
-                f"ZUPT gravity: Extreme residual rejected (Mahal={np.sqrt(mahal_sq):.1f})",
-                throttle_duration_sec=2.0
-            )
-            return
-
-        # For moderate outliers, proceed but limit correction magnitude
-        correction_scale = 1.0
-        if mahal_sq > MAHAL_LIMIT_CORRECTION:
-            correction_scale = MAHAL_LIMIT_CORRECTION / mahal_sq
-            self.get_logger().warn(
-                f"ZUPT gravity: Large residual, scaling correction by {correction_scale:.2f}",
-                throttle_duration_sec=2.0
-            )
-
-        # Kalman gain
         K = self.P @ H.T @ S_inv
 
-        # Error state correction (apply scaling for outliers)
-        dx = correction_scale * (K @ z_res)
+        # Error state correction
+        dx = K @ z_res
 
-        # Update covariance (Joseph form) - always update P even for scaled corrections
+        # Update covariance (Joseph form)
         I = np.eye(15)
         IKH = I - K @ H
-        self.P = IKH @ self.P @ IKH.T + K @ R_gravity @ K.T
+        self.P = IKH @ self.P @ IKH.T + K @ R_gravity_xy @ K.T
         self.P = 0.5 * (self.P + self.P.T)
 
-        # Apply orientation correction via quaternion multiplication
-        # Error state dθ (3D rotation vector) -> quaternion
-        rot_correction = dx[6:9]
-        rot_corr_norm = np.linalg.norm(rot_correction)
+        # Apply XY accel bias correction only
+        bias_correction = dx[9:11]  # Only ba_x, ba_y
 
-        if rot_corr_norm > 1e-8:
-            # Limit large corrections - but allow bigger than before to recover faster
-            MAX_ROT_CORR = 0.2  # ~12 degrees max per update (was 0.1)
-            if rot_corr_norm > MAX_ROT_CORR:
-                rot_correction = rot_correction * (MAX_ROT_CORR / rot_corr_norm)
+        # Limit bias correction magnitude
+        MAX_BIAS_CORR = 0.05  # Max 0.05 m/s² per update
+        bias_corr_norm = np.linalg.norm(bias_correction)
+        if bias_corr_norm > MAX_BIAS_CORR:
+            bias_correction = bias_correction * (MAX_BIAS_CORR / bias_corr_norm)
 
-            dq_rot = R.from_rotvec(rot_correction)
-            q_new_obj = rot * dq_rot  # Apply rotation correction
-            q_new = q_new_obj.as_quat()  # [x, y, z, w]
-            self.x[6:10] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]])
-
-        # Apply bias correction
-        self.x[10:13] += dx[9:12]
+        self.x[9:11] += bias_correction
 
         # Clip biases to reasonable range
         MAX_ACCEL_BIAS = 0.5
-        self.x[10:13] = np.clip(self.x[10:13], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
+        self.x[9:11] = np.clip(self.x[9:11], -MAX_ACCEL_BIAS, MAX_ACCEL_BIAS)
 
         # Log significant corrections
-        if rot_corr_norm > 0.01:
+        if bias_corr_norm > 0.01:
             self.get_logger().info(
-                f"ZUPT Gravity: Tilt corrected by {np.degrees(rot_corr_norm):.2f} deg",
-                throttle_duration_sec=1.0
+                f"ZUPT Bias: XY accel bias corrected by [{bias_correction[0]:.4f}, {bias_correction[1]:.4f}] m/s²",
+                throttle_duration_sec=2.0
             )
 
     def predict_synthetic(self, dt, fixed_vx, fixed_omega_z):
@@ -1041,27 +990,33 @@ class EKFNode(Node):
 
         # ===================================================================
         # STEP 1: Nominal State Propagation (Non-linear Kinematics)
-        # ROBOCENTRIC: v_b is in body frame, gravity must be transformed to body
+        # PLANAR ROBOCENTRIC: Only XY position/velocity, yaw-only orientation
         # ===================================================================
 
+        # For planar robot, we simplify to 2D + yaw:
+        # - Position: only X, Y update (Z = 0)
+        # - Velocity: only X, Y in body frame (Z = 0)
+        # - Orientation: only yaw (rotation around Z), roll/pitch = 0
+
         # Gravity in body frame: g_b = R_wb^T @ g_w
+        # For planar with roll=pitch=0, g_body ≈ [0, 0, g]
         g_body = R_wb.T @ self.g
 
-        # Body-frame acceleration: a_b = a_measured - ba - g_b - ω × v_b
-        # The accelerometer measures: a_m = a_true - g (specific force)
-        # So: a_true = a_m + g, but we want gravity-compensated acceleration
-        # In body frame: acc_body = a_corrected - g_body (SUBTRACT, not add!)
-        # The Coriolis term (ω × v_b) accounts for rotating reference frame
-        coriolis = np.cross(w_corrected, v_b)
-        acc_body = a_corrected - g_body - coriolis  # FIXED: subtract gravity
+        # Body-frame acceleration (planar: only use XY components)
+        # acc_body = a_corrected - g_body - ω × v_b
+        # For planar robot: only consider yaw rotation (w_z) for Coriolis
+        w_planar = np.array([0.0, 0.0, w_corrected[2]])  # Only yaw rate
+        coriolis = np.cross(w_planar, v_b)
+        acc_body = a_corrected - g_body - coriolis
 
-        # --- GROUND ROBOT CONSTRAINTS ---
-        # For body-frame: Z-body acceleration should be ~0 (robot doesn't jump)
-        # But we need to be careful - body Z is not world Z when tilted
+        # --- PLANAR CONSTRAINT: Zero out Z acceleration ---
+        # Ground robot cannot accelerate in Z direction
+        acc_body[2] = 0.0
 
         # Soft limit for extreme cases only (e.g., sensor glitches)
         MAX_ACCEL = 10.0  # m/s² - allow larger transients, only clip glitches
         acc_body_clipped = np.clip(acc_body, -MAX_ACCEL, MAX_ACCEL)
+        acc_body_clipped[2] = 0.0  # Ensure Z stays zero after clipping
 
         acc_body_norm = np.linalg.norm(acc_body)
 
@@ -1078,13 +1033,11 @@ class EKFNode(Node):
         if self._debug_counter % 400 == 1:
             self.get_logger().info(f"Body Accel: [{acc_body[0]:.3f}, {acc_body[1]:.3f}, {acc_body[2]:.3f}] m/s^2")
 
-        # --- Velocity Update (Body Frame) ---
-        # v_b_new = v_b + acc_body * dt
-        v_b_new = v_b + acc_body_clipped * dt
-
-        # For ground robot: body-frame Z velocity should be ~0
-        # (robot doesn't move up/down relative to its own frame)
-        v_b_new[2] = 0.0
+        # --- Velocity Update (Body Frame) - PLANAR ---
+        # v_b_new = v_b + acc_body * dt (only XY)
+        v_b_new = v_b.copy()
+        v_b_new[0:2] = v_b[0:2] + acc_body_clipped[0:2] * dt  # Only update XY
+        v_b_new[2] = 0.0  # Z velocity always zero for planar
 
         # Velocity safety limit - TIGHT for ground robot
         # Robot physically cannot exceed ~2 m/s, so any higher is divergence
@@ -1097,71 +1050,51 @@ class EKFNode(Node):
                 throttle_duration_sec=1.0
             )
 
-        # --- Position Update (World Frame) ---
-        # p_w_new = p_w + R_wb @ v_b * dt
-        # Note: We use v_b (not v_b_new) for position update (first-order integration)
-        v_world = R_wb @ v_b  # Transform body velocity to world frame for position update
-        p_new = p + v_world * dt
+        # --- Position Update (World Frame) - PLANAR ---
+        # p_w_new = p_w + R_wb @ v_b * dt (only XY)
+        # For planar, use yaw-only rotation for position update
+        yaw = R.from_quat([q[1], q[2], q[3], q[0]]).as_euler('zyx')[0]
+        cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+        # v_world_xy = R_z(yaw) @ v_b_xy
+        v_world_x = cos_yaw * v_b[0] - sin_yaw * v_b[1]
+        v_world_y = sin_yaw * v_b[0] + cos_yaw * v_b[1]
 
-        # Ground constraint: Z position should be 0
-        p_new[2] = 0.0
+        p_new = p.copy()
+        p_new[0] = p[0] + v_world_x * dt  # X position
+        p_new[1] = p[1] + v_world_y * dt  # Y position
+        p_new[2] = 0.0  # Z position always zero
 
-        # --- Orientation Update (Quaternion Integration) ---
-        # Using quaternion exponential map: q_k = q_{k-1} ⊗ exp(0.5 * ω_corrected * dt)
-        # Reference: MatthewHampsey/mekf model.py - quaternion derivative method
-        w_norm = np.linalg.norm(w_corrected)
+        # --- Orientation Update (YAW ONLY - Planar) ---
+        # For planar robot, only integrate yaw (rotation around Z axis)
+        # Ignore roll/pitch gyro components - robot stays level
+        w_z = w_corrected[2]  # Only yaw rate
 
         # Log gyro activity for debugging rotation issues
         if not hasattr(self, '_gyro_debug_counter'):
             self._gyro_debug_counter = 0
         self._gyro_debug_counter += 1
-        if self._gyro_debug_counter % 400 == 1 and w_norm > 0.05:
+        if self._gyro_debug_counter % 400 == 1 and abs(w_z) > 0.05:
             self.get_logger().info(
-                f"Gyro: wx={w_corrected[0]:.3f}, wy={w_corrected[1]:.3f}, wz={w_corrected[2]:.3f} rad/s | "
-                f"bias: [{bg[0]:.4f},{bg[1]:.4f},{bg[2]:.4f}]"
+                f"Gyro (planar): wz={w_z:.3f} rad/s (ignored: wx={w_corrected[0]:.3f}, wy={w_corrected[1]:.3f}) | "
+                f"bias_z: {bg[2]:.4f}"
             )
 
-        if w_norm > 1e-8:
-            # Exact quaternion exponential for rotation vector θ = ω*dt
-            # Δq = [cos(|θ|/2), sin(|θ|/2) * θ/|θ|]
-            half_angle = 0.5 * w_norm * dt
-            axis = w_corrected / w_norm
-            dq = np.array([
-                axis[0] * np.sin(half_angle),
-                axis[1] * np.sin(half_angle),
-                axis[2] * np.sin(half_angle),
-                np.cos(half_angle)
-            ])  # [x, y, z, w] for scipy
+        # Get current yaw from quaternion
+        current_yaw = R.from_quat([q[1], q[2], q[3], q[0]]).as_euler('zyx')[0]
 
-            # Quaternion multiplication: q_new = q_old ⊗ dq
-            q_new_obj = rot * R.from_quat(dq)
-            q_new_scipy = q_new_obj.as_quat()  # [x, y, z, w]
-            q_new = np.array([q_new_scipy[3], q_new_scipy[0], q_new_scipy[1], q_new_scipy[2]])
-        else:
-            # For very small rotations, quaternion stays the same
-            q_new = q.copy()
+        # Integrate yaw only: yaw_new = yaw + w_z * dt
+        yaw_new = current_yaw + w_z * dt
 
-        # --- GROUND ROBOT CONSTRAINT: Limit Roll/Pitch ---
-        # A ground robot cannot physically have large roll or pitch angles.
-        # Clamp to ±10 degrees to prevent divergence.
-        MAX_TILT = np.radians(10.0)  # 10 degrees max tilt
-        rot_new = R.from_quat([q_new[1], q_new[2], q_new[3], q_new[0]])
-        euler_new = rot_new.as_euler('zyx')  # [yaw, pitch, roll]
-        yaw_new, pitch_new, roll_new = euler_new
+        # Wrap yaw to [-π, π]
+        yaw_new = np.arctan2(np.sin(yaw_new), np.cos(yaw_new))
 
-        # Clamp roll and pitch
-        if abs(roll_new) > MAX_TILT or abs(pitch_new) > MAX_TILT:
-            roll_clamped = np.clip(roll_new, -MAX_TILT, MAX_TILT)
-            pitch_clamped = np.clip(pitch_new, -MAX_TILT, MAX_TILT)
-            # Reconstruct quaternion with clamped angles
-            rot_clamped = R.from_euler('zyx', [yaw_new, pitch_clamped, roll_clamped])
-            q_clamped = rot_clamped.as_quat()  # [x, y, z, w]
-            q_new = np.array([q_clamped[3], q_clamped[0], q_clamped[1], q_clamped[2]])
-            self.get_logger().warn(
-                f"Orientation clamped: roll {np.degrees(roll_new):.1f}→{np.degrees(roll_clamped):.1f}°, "
-                f"pitch {np.degrees(pitch_new):.1f}→{np.degrees(pitch_clamped):.1f}°",
-                throttle_duration_sec=2.0
-            )
+        # Construct quaternion from yaw only (roll=0, pitch=0)
+        # q = [cos(yaw/2), 0, 0, sin(yaw/2)] for rotation around Z
+        half_yaw = yaw_new / 2.0
+        q_new = np.array([np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)])  # [w, x, y, z]
+
+        # Normalize for safety
+        q_new = q_new / np.linalg.norm(q_new)
 
         # --- Bias Update (Random Walk Model) ---
         # Biases are constant in the prediction step (drift added via process noise)
@@ -1198,37 +1131,48 @@ class EKFNode(Node):
         # Error state ordering: [δp, δv_b, δθ, δba, δbg]
         #                       [0:3, 3:6, 6:9, 9:12, 12:15]
 
-        # Construct continuous-time Jacobian F for ROBOCENTRIC formulation
+        # Construct continuous-time Jacobian F for PLANAR ROBOCENTRIC formulation
+        # Only XY position, XY velocity, and yaw dynamics are active
         F = np.zeros((15, 15))
 
-        # --- Position error dynamics (world frame) ---
-        # p_w = ∫ R_wb @ v_b dt
-        # δṗ = R_wb @ δv_b + [R_wb @ v_b]_× @ δθ
-        # d(δp)/d(δv_b): Position depends on body velocity through rotation
-        F[0:3, 3:6] = R_wb
-        # d(δp)/d(δθ): Orientation error affects how body velocity maps to world
-        F[0:3, 6:9] = -skew_symmetric(R_wb @ v_b)
+        # Yaw-only rotation matrix (2D rotation in XY plane)
+        R_yaw = np.array([
+            [cos_yaw, -sin_yaw, 0],
+            [sin_yaw,  cos_yaw, 0],
+            [0,        0,       1]
+        ])
 
-        # --- Velocity error dynamics (body frame) ---
-        # v_b_dot = a_b - ba - g_b - ω × v_b  (FIXED: subtract g_b)
-        # δv̇_b = -[a_corrected - g_b]_× @ δθ - δba - [ω]_× @ δv_b + [v_b]_× @ δbg
-        #
-        # d(δv_b)/d(δv_b): Coriolis coupling -[ω]_×
-        F[3:6, 3:6] = -skew_symmetric(w_corrected)
-        # d(δv_b)/d(δθ): How orientation error affects gravity and acceleration
-        # Since acc_body = a_corrected - g_body, the Jacobian uses this difference
-        F[3:6, 6:9] = -skew_symmetric(a_corrected - g_body)  # FIXED: subtract g_body
-        # d(δv_b)/d(δba): Direct effect of accel bias on body acceleration
-        F[3:6, 9:12] = -np.eye(3)
-        # d(δv_b)/d(δbg): Gyro bias affects Coriolis term
-        F[3:6, 12:15] = skew_symmetric(v_b)
+        # --- Position error dynamics (world frame, XY only) ---
+        # p_w = ∫ R_yaw @ v_b dt
+        # δṗ = R_yaw @ δv_b + [R_yaw @ v_b]_× @ δθ
+        # d(δp)/d(δv_b): Position depends on body velocity through yaw rotation
+        F[0:2, 3:5] = R_yaw[0:2, 0:2]  # Only XY block
+        # d(δp)/d(δθ_z): Only yaw error affects position (via velocity rotation)
+        # [R_yaw @ v_b]_× @ [0,0,δθz]^T = [-vy_world, vx_world, 0]^T * δθz
+        v_world_vec = R_yaw @ v_b
+        F[0, 8] = -v_world_vec[1]  # d(px)/d(θz) = -vy_world
+        F[1, 8] =  v_world_vec[0]  # d(py)/d(θz) =  vx_world
 
-        # --- Orientation error dynamics ---
-        # δθ̇ = -[ω_corrected]_× * δθ - δbg
-        # d(δθ)/d(δθ): Gyro measurement coupling (MEKF key insight!)
-        F[6:9, 6:9] = -skew_symmetric(w_corrected)
-        # d(δθ)/d(δbg): Effect of gyro bias error on orientation
-        F[6:9, 12:15] = -np.eye(3)
+        # --- Velocity error dynamics (body frame, XY only) ---
+        # For planar: use yaw-only Coriolis term
+        # d(δv_b)/d(δv_b): Coriolis coupling from yaw rate only
+        # -[0,0,wz]_× = [[0, wz, 0], [-wz, 0, 0], [0, 0, 0]]
+        F[3, 4] =  w_z   # d(vx)/d(vy) = wz (Coriolis)
+        F[4, 3] = -w_z   # d(vy)/d(vx) = -wz
+
+        # d(δv_b)/d(δθ_z): How yaw error affects acceleration
+        # Simplified for planar - yaw error rotates gravity/accel contribution
+        # d(δv_b)/d(δba): Direct effect of accel bias on body acceleration (XY only)
+        F[3:5, 9:11] = -np.eye(2)  # Only XY accel bias affects XY velocity
+        # d(δv_b)/d(δbg_z): Gyro bias affects Coriolis term
+        # [v_b]_× @ [0,0,δbg_z]^T = [-vy, vx, 0]^T * δbg_z
+        F[3, 14] = -v_b[1]  # d(vx)/d(bg_z) = -vy
+        F[4, 14] =  v_b[0]  # d(vy)/d(bg_z) = vx
+
+        # --- Orientation error dynamics (yaw only) ---
+        # δθz_dot = -δbg_z (simplified for planar)
+        # d(δθz)/d(δbg_z): Effect of gyro bias error on yaw
+        F[8, 14] = -1.0  # Only yaw-gyrobias coupling
 
         # --- Bias error dynamics ---
         # δḃa = 0, δḃg = 0 (Random walk - noise added separately)
@@ -1254,42 +1198,53 @@ class EKFNode(Node):
         Q_accel = self.Q_a * np.eye(3)       # Accel noise variance
         Q_accel_bias = self.Q_ba * np.eye(3) # Accel bias random walk
 
-        # Build discrete process noise matrix Q
-        # Following the structure from MatthewHampsey/mekf kalman2.py
+        # Build discrete process noise matrix Q for PLANAR robot
+        # Only XY position, XY velocity, yaw, XY accel bias, Z gyro bias are active
         Qi = np.zeros((15, 15))
 
-        # Position noise (from velocity integration of acceleration noise)
-        # Q_p = Q_a * dt^4/4 + Q_ba * dt^6/36 (approximated)
-        Qi[0:3, 0:3] = Q_accel * (dt**4 / 4.0)
+        # Position noise (XY only)
+        Qi[0, 0] = self.Q_a * (dt**4 / 4.0)  # px
+        Qi[1, 1] = self.Q_a * (dt**4 / 4.0)  # py
+        # Z position has tiny noise (constrained)
+        Qi[2, 2] = 1e-10
 
-        # Velocity noise (from acceleration noise)
-        # Q_v = Q_a * dt^2 + higher order terms
-        Qi[3:6, 3:6] = Q_accel * dt + Q_accel_bias * (dt**3 / 3.0)
+        # Velocity noise (XY only)
+        Qi[3, 3] = self.Q_a * dt + self.Q_ba * (dt**3 / 3.0)  # vx
+        Qi[4, 4] = self.Q_a * dt + self.Q_ba * (dt**3 / 3.0)  # vy
+        # Z velocity has tiny noise (constrained)
+        Qi[5, 5] = 1e-10
 
-        # Position-Velocity cross-correlation
-        Qi[0:3, 3:6] = Q_accel * (dt**3 / 2.0)
-        Qi[3:6, 0:3] = Qi[0:3, 3:6].T
+        # Position-Velocity cross-correlation (XY only)
+        Qi[0, 3] = self.Q_a * (dt**3 / 2.0)
+        Qi[3, 0] = Qi[0, 3]
+        Qi[1, 4] = self.Q_a * (dt**3 / 2.0)
+        Qi[4, 1] = Qi[1, 4]
 
-        # Orientation noise (from gyro noise)
-        # Q_θ = Q_g * dt + Q_bg * dt^3/3
-        Qi[6:9, 6:9] = Q_gyro * dt + Q_gyro_bias * (dt**3 / 3.0)
+        # Orientation noise (YAW ONLY - index 8)
+        # Roll (6) and Pitch (7) are constrained to zero
+        Qi[6, 6] = 1e-10  # roll - constrained
+        Qi[7, 7] = 1e-10  # pitch - constrained
+        Qi[8, 8] = self.Q_g * dt + self.Q_bg * (dt**3 / 3.0)  # yaw
 
-        # Orientation-Gyro bias cross-correlation
-        # Reference: MatthewHampsey/mekf - Q[0:3, 9:12] = -gyro_bias_cov*(dt^2)/2
-        Qi[6:9, 12:15] = -Q_gyro_bias * (dt**2 / 2.0)
-        Qi[12:15, 6:9] = Qi[6:9, 12:15].T
+        # Yaw-Gyro bias z cross-correlation
+        Qi[8, 14] = -self.Q_bg * (dt**2 / 2.0)
+        Qi[14, 8] = Qi[8, 14]
 
-        # Accel bias random walk
-        Qi[9:12, 9:12] = Q_accel_bias * dt
-        # FIX: Lock ba_z covariance to zero (unobservable for ground robot)
-        Qi[11, 11] = 0.0
+        # Accel bias random walk (XY only, Z locked)
+        Qi[9, 9] = self.Q_ba * dt    # ba_x
+        Qi[10, 10] = self.Q_ba * dt  # ba_y
+        Qi[11, 11] = 1e-10           # ba_z - locked (unobservable)
 
-        # Velocity-Accel bias cross-correlation
-        Qi[3:6, 9:12] = -Q_accel_bias * (dt**2 / 2.0)
-        Qi[9:12, 3:6] = Qi[3:6, 9:12].T
+        # Velocity-Accel bias cross-correlation (XY only)
+        Qi[3, 9] = -self.Q_ba * (dt**2 / 2.0)
+        Qi[9, 3] = Qi[3, 9]
+        Qi[4, 10] = -self.Q_ba * (dt**2 / 2.0)
+        Qi[10, 4] = Qi[4, 10]
 
-        # Gyro bias random walk
-        Qi[12:15, 12:15] = Q_gyro_bias * dt
+        # Gyro bias random walk (Z only for planar - yaw)
+        Qi[12, 12] = 1e-10           # bg_x - not used for planar
+        Qi[13, 13] = 1e-10           # bg_y - not used for planar
+        Qi[14, 14] = self.Q_bg * dt  # bg_z - yaw gyro bias
 
         # ===================================================================
         # STEP 4: Covariance Update
@@ -1315,24 +1270,28 @@ class EKFNode(Node):
             self.P += np.eye(15) * 1e-8
             self.get_logger().warn("Covariance regularization applied", throttle_duration_sec=5.0)
 
-        # Ground robot Z-constraint: Apply as soft constraint via increased process noise
-        # Per recommend.md: DON'T zero out rows/columns as that creates near-singular matrix
-        # Instead, keep Z uncertainty small but mathematically valid
-        # Scale down Z-related covariances while preserving positive-definiteness
-        z_damping = 0.1  # Damp Z-related covariances each step
-        self.P[2, 0:2] *= z_damping
-        self.P[0:2, 2] *= z_damping
-        self.P[2, 3:] *= z_damping
-        self.P[3:, 2] *= z_damping
-        self.P[5, 0:5] *= z_damping
-        self.P[0:5, 5] *= z_damping
-        self.P[5, 6:] *= z_damping
-        self.P[6:, 5] *= z_damping
-        # Keep diagonal small but non-zero
-        self.P[2, 2] = max(self.P[2, 2] * z_damping, 1e-4)
-        self.P[5, 5] = max(self.P[5, 5] * z_damping, 1e-4)
+        # ===================================================================
+        # PLANAR CONSTRAINT ENFORCEMENT ON COVARIANCE
+        # ===================================================================
+        # For planar robot, constrained states are:
+        #   - pz (index 2), vz (index 5)
+        #   - roll (index 6), pitch (index 7)
+        #   - ba_z (index 11), bg_x (index 12), bg_y (index 13)
+        # We damp cross-correlations and keep diagonal small but non-zero
 
-        # Ensure symmetry again after Z-constraint
+        constrained_indices = [2, 5, 6, 7, 11, 12, 13]
+        z_damping = 0.1  # Damp constrained state covariances each step
+
+        for idx in constrained_indices:
+            # Damp off-diagonal elements (cross-correlations)
+            for j in range(15):
+                if j != idx:
+                    self.P[idx, j] *= z_damping
+                    self.P[j, idx] *= z_damping
+            # Keep diagonal small but non-zero for numerical stability
+            self.P[idx, idx] = max(self.P[idx, idx] * z_damping, 1e-6)
+
+        # Ensure symmetry again after constraint enforcement
         self.P = 0.5 * (self.P + self.P.T)
 
         # --- State Buffer for Time Delay Compensation ---

@@ -2,3 +2,4 @@ build
 install
 log
 src/vio_ekf/models/aruco_*
+src/final_project
