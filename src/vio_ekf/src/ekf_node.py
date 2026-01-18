@@ -941,9 +941,6 @@ class EKFNode(Node):
         else:
             self.zupt_gyro_only_counter = 0
 
-        # Check if stationary based on gyro AND vision
-        is_stationary = False
-
         # Decay vision motion cooldown
         if self.vision_motion_cooldown > 0:
             self.vision_motion_cooldown -= 1
@@ -958,8 +955,6 @@ class EKFNode(Node):
             vision_says_moving = self.vision_motion_cooldown > 0
 
             if gyro_says_stationary and not vision_says_moving:
-                is_stationary = True
-
                 # --- ZUPT Part 1: Formal Velocity Update (per recommend.md Section 5) ---
                 # Perform a FORMAL EKF update with z=0, v=0 instead of direct state override.
                 # This updates both state AND covariance consistently.
@@ -1340,20 +1335,11 @@ class EKFNode(Node):
 
             # Compute range and bearing from pixel measurement
             # Use camera intrinsics to get normalized image coordinates
-            # Then compute bearing from camera geometry
             fx = self.K[0, 0]
-            fy = self.K[1, 1]
             cx = self.K[0, 2]
-            cy = self.K[1, 2]
 
-            # Normalized image coordinates (ray direction in camera frame)
+            # Normalized horizontal image coordinate (ray direction in camera frame)
             x_norm = (u_meas - cx) / fx
-            y_norm = (v_meas - cy) / fy
-
-            # Bearing in camera frame: angle from optical axis (Z) to ray in XZ plane
-            # Camera frame: Z = forward (depth), X = right, Y = down
-            # Bearing = atan2(X, Z) where Z = 1 for normalized coords
-            bearing_camera = np.arctan2(x_norm, 1.0)
 
             # To get range, we need the actual 3D position from the known map
             # Transform landmark to body frame to compute true range
@@ -1371,13 +1357,10 @@ class EKFNode(Node):
             if lm_cam[2] < 0.1:
                 continue
 
-            # Predicted range and bearing (PLANAR - XY only)
+            # Predicted range (PLANAR - XY only)
             pred_range = np.linalg.norm(lm_body[0:2])  # XY distance only
             if pred_range < 0.3:
                 continue  # Too close
-
-            # Bearing in body frame (angle from body X-axis to landmark in XY plane)
-            pred_bearing = np.arctan2(lm_body[1], lm_body[0])
 
             # ===================================================================
             # MEASURED BEARING from pixel coordinates
