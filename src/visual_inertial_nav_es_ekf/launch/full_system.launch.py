@@ -43,10 +43,10 @@ def generate_launch_description():
         ),
 
         # =========================================================
-        # 2. Ignition Gazebo Simulator
+        # 2. Ignition Gazebo Simulator (headless server mode)
         # =========================================================
         ExecuteProcess(
-            cmd=['ign', 'gazebo', '-r', world_file],
+            cmd=['ign', 'gazebo', '-r', '-s', world_file],  # -s for server-only (headless)
             output='screen',
             name='ignition_gazebo'
         ),
