@@ -14,6 +14,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # Include all launch files
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        # Include environment/world files
+        (os.path.join('share', package_name, 'environment'), glob('environment/*.sdf')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

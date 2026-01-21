@@ -1,10 +1,23 @@
+# Visual Inertial Navigation ES-EKF
+
+## Quick Start (Single Command)
+
+```bash
 colcon build --packages-select visual_inertial_nav_es_ekf
+source install/setup.bash
+ros2 launch visual_inertial_nav_es_ekf full_system.launch.py
+```
 
-ros2 launch visual_inertial_nav_es_ekf visual_inertial_nav_es_ekf.py
+This launches everything automatically:
+- Ignition Gazebo with the project world
+- ROS-Gazebo bridge
+- ES-EKF visual-inertial navigation
+- Visual detector
+- Trajectory monitor
+- Teleop keyboard (opens in xterm)
+- Foxglove bridge (port 8765)
 
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/vehicle_blue/cmd_vel
+## Manual Launch (Separate Terminals)
 
-ign gazebo -r project_world.sdf
-
-ros2 launch foxglove_bridge foxglove_birdge_launch.xml
+If you prefer running components separately:
 
